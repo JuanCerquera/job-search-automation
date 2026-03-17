@@ -1,5 +1,6 @@
 import os
 import random
+import threading
 import time
 from datetime import date, datetime
 from pathlib import Path
@@ -21,6 +22,7 @@ RESULTS_PER_PAGE = 25
 MAX_PAGES_PER_KEYWORD = 3
 PAGE_DELAY_RANGE_SECONDS = (2, 4)
 KEYWORD_DELAY_RANGE_SECONDS = (3, 6)
+HEARTBEAT_INTERVAL_SECONDS = 5
 USER_AGENT = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
     "AppleWebKit/537.36 (KHTML, like Gecko) "
@@ -56,6 +58,26 @@ HEADERS = [
 def log(message: str) -> None:
     timestamp = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S UTC")
     print(f"[{timestamp}] {message}", flush=True)
+
+
+def run_with_heartbeat(action: str, func, *args, **kwargs):
+    done = threading.Event()
+
+    def heartbeat() -> None:
+        elapsed = 0
+        while not done.wait(HEARTBEAT_INTERVAL_SECONDS):
+            elapsed += HEARTBEAT_INTERVAL_SECONDS
+            log(f"Heartbeat: still {action}... ({elapsed}s elapsed)")
+
+    thread = threading.Thread(target=heartbeat, daemon=True)
+    thread.start()
+    started = time.monotonic()
+    try:
+        return func(*args, **kwargs)
+    finally:
+        done.set()
+        thread.join(timeout=0.2)
+        log(f"Finished {action} in {time.monotonic() - started:.1f}s")
 
 
 def _sleep_random(delay_range: tuple[int, int], reason: str) -> None:
@@ -117,14 +139,25 @@ def scrape_keyword_jobs(page, keyword: str) -> List[Dict[str, str]]:
         log(f"Loading page {page_index + 1}/{MAX_PAGES_PER_KEYWORD}: {search_url}")
 
         try:
-            page.goto(search_url, wait_until="domcontentloaded", timeout=60000)
+            run_with_heartbeat(
+                action=f"loading page {page_index + 1} for keyword '{keyword}'",
+                func=page.goto,
+                url=search_url,
+                wait_until="domcontentloaded",
+                timeout=60000,
+            )
         except PlaywrightTimeoutError:
             log(f"Timed out loading search page for keyword '{keyword}', start={start}")
             continue
 
         try:
             log(f"Waiting for job cards on page {page_index + 1} for keyword '{keyword}'")
-            page.wait_for_selector("ul.jobs-search__results-list li", timeout=15000)
+            run_with_heartbeat(
+                action=f"waiting for job cards on page {page_index + 1} for keyword '{keyword}'",
+                func=page.wait_for_selector,
+                selector="ul.jobs-search__results-list li",
+                timeout=15000,
+            )
         except PlaywrightTimeoutError:
             log(f"No job list found for keyword '{keyword}', page {page_index + 1}")
             break

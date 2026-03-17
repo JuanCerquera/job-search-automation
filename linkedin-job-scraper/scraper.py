@@ -1,7 +1,7 @@
 import os
 import random
 import time
-from datetime import date
+from datetime import date, datetime
 from pathlib import Path
 from typing import Dict, List
 from urllib.parse import quote_plus
@@ -53,9 +53,14 @@ HEADERS = [
 ]
 
 
+def log(message: str) -> None:
+    timestamp = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S UTC")
+    print(f"[{timestamp}] {message}", flush=True)
+
+
 def _sleep_random(delay_range: tuple[int, int], reason: str) -> None:
     sleep_seconds = random.uniform(*delay_range)
-    print(f"Sleeping {sleep_seconds:.2f}s ({reason})")
+    log(f"Sleeping {sleep_seconds:.2f}s ({reason})")
     time.sleep(sleep_seconds)
 
 
@@ -101,7 +106,7 @@ def _safe_attr(card, selectors: List[str], attr_name: str) -> str:
 
 def scrape_keyword_jobs(page, keyword: str) -> List[Dict[str, str]]:
     jobs: List[Dict[str, str]] = []
-    print(f"\n=== Scraping keyword: {keyword} ===")
+    log(f"=== Scraping keyword: {keyword} ===")
 
     for page_index in range(MAX_PAGES_PER_KEYWORD):
         if page_index > 0:
@@ -109,27 +114,32 @@ def scrape_keyword_jobs(page, keyword: str) -> List[Dict[str, str]]:
 
         start = page_index * RESULTS_PER_PAGE
         search_url = _build_search_url(keyword, start)
-        print(f"Loading page {page_index + 1}/{MAX_PAGES_PER_KEYWORD}: {search_url}")
+        log(f"Loading page {page_index + 1}/{MAX_PAGES_PER_KEYWORD}: {search_url}")
 
         try:
             page.goto(search_url, wait_until="domcontentloaded", timeout=60000)
         except PlaywrightTimeoutError:
-            print(f"Timed out loading search page for keyword '{keyword}', start={start}")
+            log(f"Timed out loading search page for keyword '{keyword}', start={start}")
             continue
 
         try:
+            log(f"Waiting for job cards on page {page_index + 1} for keyword '{keyword}'")
             page.wait_for_selector("ul.jobs-search__results-list li", timeout=15000)
         except PlaywrightTimeoutError:
-            print(f"No job list found for keyword '{keyword}', page {page_index + 1}")
+            log(f"No job list found for keyword '{keyword}', page {page_index + 1}")
             break
 
         cards = page.locator("ul.jobs-search__results-list li")
         card_count = cards.count()
-        print(f"Found {card_count} cards on this page")
+        log(f"Found {card_count} cards on page {page_index + 1}")
         if card_count == 0:
             break
 
         for i in range(card_count):
+            if i > 0 and i % 10 == 0:
+                log(
+                    f"Parsed {i}/{card_count} cards on page {page_index + 1} for keyword '{keyword}'"
+                )
             card = cards.nth(i)
             title = _safe_text(
                 card,
@@ -172,10 +182,10 @@ def scrape_keyword_jobs(page, keyword: str) -> List[Dict[str, str]]:
             )
 
         if card_count < RESULTS_PER_PAGE:
-            print("Less than 25 results on page; stopping pagination for this keyword.")
+            log("Less than 25 results on page; stopping pagination for this keyword.")
             break
 
-    print(f"Collected {len(jobs)} rows for keyword '{keyword}'")
+    log(f"Collected {len(jobs)} rows for keyword '{keyword}'")
     return jobs
 
 
@@ -183,6 +193,7 @@ def get_gspread_client():
     creds_path = Path(CREDS_FILE)
     if not creds_path.exists():
         raise FileNotFoundError(f"Google credentials file not found: {CREDS_FILE}")
+    log(f"Loading Google credentials from: {creds_path.as_posix()}")
 
     scopes = [
         "https://www.googleapis.com/auth/spreadsheets",
@@ -193,6 +204,7 @@ def get_gspread_client():
     )
     if credentials.expired and credentials.refresh_token:
         credentials.refresh(Request())
+    log("Google Sheets client authorized.")
     return gspread.authorize(credentials)
 
 
@@ -200,11 +212,14 @@ def get_jobs_worksheet(client):
     if not SHEET_ID:
         raise ValueError("SHEET_ID is not set. Provide it via environment variable.")
 
+    log(f"Opening spreadsheet with SHEET_ID: {SHEET_ID}")
     spreadsheet = client.open_by_key(SHEET_ID)
     try:
         worksheet = spreadsheet.worksheet(WORKSHEET_NAME)
+        log(f"Using existing worksheet: {WORKSHEET_NAME}")
     except WorksheetNotFound:
         worksheet = spreadsheet.add_worksheet(title=WORKSHEET_NAME, rows=1000, cols=20)
+        log(f"Created worksheet: {WORKSHEET_NAME}")
     return worksheet
 
 
@@ -212,26 +227,28 @@ def ensure_headers(worksheet) -> None:
     existing_values = worksheet.get_all_values()
     if not existing_values:
         worksheet.append_row(HEADERS, value_input_option="RAW")
-        print("Header row initialized.")
+        log("Header row initialized.")
         return
 
     first_row = existing_values[0]
     if first_row[: len(HEADERS)] != HEADERS:
         worksheet.update("A1:H1", [HEADERS], value_input_option="RAW")
-        print("Header row updated to expected format.")
+        log("Header row updated to expected format.")
 
 
 def get_existing_job_urls(worksheet) -> set[str]:
+    log("Loading existing rows from sheet for deduplication.")
     rows = worksheet.get_all_values()
     existing_urls = set()
     for row in rows[1:]:
         if len(row) >= 5 and row[4].strip():
             existing_urls.add(_normalize_job_url(row[4].strip()))
-    print(f"Loaded {len(existing_urls)} existing URLs from sheet")
+    log(f"Loaded {len(existing_urls)} existing URLs from sheet")
     return existing_urls
 
 
 def main() -> None:
+    log("Scraper started.")
     client = get_gspread_client()
     worksheet = get_jobs_worksheet(client)
     ensure_headers(worksheet)
@@ -239,8 +256,10 @@ def main() -> None:
 
     date_added = date.today().isoformat()
     rows_to_append: List[List[str]] = []
+    skipped_duplicates = 0
 
     with sync_playwright() as playwright:
+        log("Launching Playwright Chromium in headless mode.")
         browser = playwright.chromium.launch(headless=True)
         context = browser.new_context(
             user_agent=USER_AGENT,
@@ -250,11 +269,13 @@ def main() -> None:
         page = context.new_page()
 
         for idx, keyword in enumerate(KEYWORDS):
+            log(f"Starting keyword {idx + 1}/{len(KEYWORDS)}: {keyword}")
             keyword_jobs = scrape_keyword_jobs(page, keyword)
 
             for job in keyword_jobs:
                 job_url = job["job_url"]
                 if job_url in existing_urls:
+                    skipped_duplicates += 1
                     continue
 
                 existing_urls.add(job_url)
@@ -271,17 +292,29 @@ def main() -> None:
                     ]
                 )
 
+            log(
+                f"Keyword complete: {keyword}. "
+                f"New rows queued so far: {len(rows_to_append)}. "
+                f"Duplicates skipped so far: {skipped_duplicates}"
+            )
             if idx < len(KEYWORDS) - 1:
                 _sleep_random(KEYWORD_DELAY_RANGE_SECONDS, "between keywords")
 
         context.close()
         browser.close()
+        log("Browser session closed.")
 
     if rows_to_append:
+        log(f"Appending {len(rows_to_append)} new rows to Google Sheet.")
         worksheet.append_rows(rows_to_append, value_input_option="RAW")
-        print(f"Appended {len(rows_to_append)} new jobs to the sheet.")
+        log(f"Appended {len(rows_to_append)} new jobs to the sheet.")
     else:
-        print("No new jobs to append.")
+        log("No new jobs to append.")
+
+    log(
+        f"Scraper finished. Total new rows: {len(rows_to_append)}. "
+        f"Total duplicates skipped: {skipped_duplicates}"
+    )
 
 
 if __name__ == "__main__":

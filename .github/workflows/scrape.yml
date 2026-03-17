@@ -11,6 +11,7 @@ jobs:
     env:
       SHEET_ID: ${{ vars.SHEET_ID }}
       CREDS_FILE: service_account.json
+      PYTHONUNBUFFERED: "1"
     defaults:
       run:
         working-directory: linkedin-job-scraper
@@ -38,4 +39,4 @@ jobs:
           EOF
 
       - name: Run scraper
-        run: python scraper.py
+        run: python -u scraper.py

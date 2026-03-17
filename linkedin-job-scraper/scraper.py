@@ -1,3 +1,4 @@
+import os
 import random
 import time
 from datetime import date
@@ -12,8 +13,8 @@ from gspread.exceptions import WorksheetNotFound
 from playwright.sync_api import TimeoutError as PlaywrightTimeoutError
 from playwright.sync_api import sync_playwright
 
-SHEET_ID = "YOUR_GOOGLE_SHEET_ID"
-CREDS_FILE = "service_account.json"
+SHEET_ID = os.getenv("SHEET_ID", "").strip()
+CREDS_FILE = os.getenv("CREDS_FILE", "service_account.json").strip()
 
 WORKSHEET_NAME = "Jobs"
 RESULTS_PER_PAGE = 25
@@ -196,8 +197,8 @@ def get_gspread_client():
 
 
 def get_jobs_worksheet(client):
-    if SHEET_ID == "YOUR_GOOGLE_SHEET_ID":
-        raise ValueError("Please set SHEET_ID at the top of scraper.py before running.")
+    if not SHEET_ID:
+        raise ValueError("SHEET_ID is not set. Provide it via environment variable.")
 
     spreadsheet = client.open_by_key(SHEET_ID)
     try:

@@ -8,6 +8,9 @@ on:
 jobs:
   scrape:
     runs-on: ubuntu-latest
+    env:
+      SHEET_ID: ${{ vars.SHEET_ID }}
+      CREDS_FILE: service_account.json
     defaults:
       run:
         working-directory: linkedin-job-scraper
@@ -31,7 +34,7 @@ jobs:
       - name: Write Google service account credentials
         run: |
           cat <<'EOF' > service_account.json
-          ${{ secrets.GCP_SERVICE_ACCOUNT_JSON }}
+          ${{ vars.GCP_SERVICE_ACCOUNT_JSON }}
           EOF
 
       - name: Run scraper

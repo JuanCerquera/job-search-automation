@@ -5,7 +5,7 @@ import threading
 import time
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
-from typing import Dict, List
+from typing import Dict, List, Tuple
 from urllib.parse import parse_qs, quote_plus, unquote, urljoin, urlparse
 
 import gspread
@@ -20,11 +20,62 @@ CREDS_FILE = os.getenv("CREDS_FILE", "service_account.json").strip()
 WORKSHEET_NAME = "Jobs"
 
 RESULTS_PER_PAGE = 25
-MAX_PAGES_PER_KEYWORD = 3
-MAX_POST_AGE_DAYS = 14
-PAGE_DELAY_RANGE_SECONDS = (2, 4)
-KEYWORD_DELAY_RANGE_SECONDS = (3, 6)
-HEARTBEAT_INTERVAL_SECONDS = 5
+
+
+def _parse_positive_int_env(name: str, default: int, minimum: int = 1) -> int:
+    raw_value = os.getenv(name, "").strip()
+    if not raw_value:
+        return default
+    try:
+        parsed_value = int(raw_value)
+    except ValueError:
+        print(
+            f"[config] Invalid integer for {name}='{raw_value}'. Using default {default}.",
+            flush=True,
+        )
+        return default
+    if parsed_value < minimum:
+        print(
+            f"[config] {name} must be >= {minimum}, got {parsed_value}. Using default {default}.",
+            flush=True,
+        )
+        return default
+    return parsed_value
+
+
+def _parse_range_env(name: str, default: Tuple[float, float]) -> Tuple[float, float]:
+    raw_value = os.getenv(name, "").strip()
+    if not raw_value:
+        return default
+
+    normalized = raw_value.replace(" ", "")
+    for separator in (",", "-"):
+        if separator in normalized:
+            parts = normalized.split(separator)
+            if len(parts) != 2:
+                break
+            try:
+                low = float(parts[0])
+                high = float(parts[1])
+            except ValueError:
+                break
+            if low <= 0 or high < low:
+                break
+            return (low, high)
+
+    print(
+        f"[config] Invalid range for {name}='{raw_value}'. "
+        f"Expected 'min,max'. Using default {default[0]},{default[1]}.",
+        flush=True,
+    )
+    return default
+
+
+MAX_PAGES_PER_KEYWORD = _parse_positive_int_env("MAX_PAGES_PER_KEYWORD", 3)
+MAX_POST_AGE_DAYS = _parse_positive_int_env("MAX_POST_AGE_DAYS", 14)
+PAGE_DELAY_RANGE_SECONDS = _parse_range_env("PAGE_DELAY_RANGE_SECONDS", (2.0, 4.0))
+KEYWORD_DELAY_RANGE_SECONDS = _parse_range_env("KEYWORD_DELAY_RANGE_SECONDS", (3.0, 6.0))
+HEARTBEAT_INTERVAL_SECONDS = _parse_positive_int_env("HEARTBEAT_INTERVAL_SECONDS", 5)
 USER_AGENT = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
     "AppleWebKit/537.36 (KHTML, like Gecko) "
@@ -97,7 +148,7 @@ def run_with_heartbeat(action: str, func, *args, **kwargs):
         log(f"Finished {action} in {time.monotonic() - started:.1f}s")
 
 
-def _sleep_random(delay_range: tuple[int, int], reason: str) -> None:
+def _sleep_random(delay_range: tuple[float, float], reason: str) -> None:
     sleep_seconds = random.uniform(*delay_range)
     log(f"Sleeping {sleep_seconds:.2f}s ({reason})")
     time.sleep(sleep_seconds)
@@ -408,6 +459,13 @@ def main() -> None:
         f"Total keywords: {len(KEYWORDS)}"
     )
     log(f"Date filter: jobs posted within the last {MAX_POST_AGE_DAYS} days.")
+    log(
+        "Runtime config: "
+        f"MAX_PAGES_PER_KEYWORD={MAX_PAGES_PER_KEYWORD}, "
+        f"PAGE_DELAY_RANGE_SECONDS={PAGE_DELAY_RANGE_SECONDS[0]}-{PAGE_DELAY_RANGE_SECONDS[1]}, "
+        f"KEYWORD_DELAY_RANGE_SECONDS={KEYWORD_DELAY_RANGE_SECONDS[0]}-{KEYWORD_DELAY_RANGE_SECONDS[1]}, "
+        f"HEARTBEAT_INTERVAL_SECONDS={HEARTBEAT_INTERVAL_SECONDS}"
+    )
 
     client = get_gspread_client()
     spreadsheet = get_spreadsheet(client)

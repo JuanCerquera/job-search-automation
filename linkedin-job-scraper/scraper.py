@@ -1,8 +1,9 @@
 import os
 import random
+import re
 import threading
 import time
-from datetime import date, datetime
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from typing import Dict, List
 from urllib.parse import quote_plus
@@ -17,9 +18,9 @@ from playwright.sync_api import sync_playwright
 SHEET_ID = os.getenv("SHEET_ID", "").strip()
 CREDS_FILE = os.getenv("CREDS_FILE", "service_account.json").strip()
 
-WORKSHEET_NAME = "Jobs"
 RESULTS_PER_PAGE = 25
 MAX_PAGES_PER_KEYWORD = 3
+MAX_POST_AGE_DAYS = 14
 PAGE_DELAY_RANGE_SECONDS = (2, 4)
 KEYWORD_DELAY_RANGE_SECONDS = (3, 6)
 HEARTBEAT_INTERVAL_SECONDS = 5
@@ -29,7 +30,7 @@ USER_AGENT = (
     "Chrome/124.0.0.0 Safari/537.36"
 )
 
-KEYWORDS = [
+DEFAULT_KEYWORDS = [
     "Robotics Software Engineer Intern",
     "Robotics Engineer Coop",
     "Embedded Systems Intern",
@@ -42,6 +43,10 @@ KEYWORDS = [
     "SLAM Engineer Intern",
     "Machine Learning Robotics Intern",
 ]
+# Optional env override from GitHub variable KEYWORDS:
+# "Keyword A|Keyword B|Keyword C"
+KEYWORDS_ENV = os.getenv("KEYWORDS", "").strip()
+KEYWORDS = [k.strip() for k in KEYWORDS_ENV.split("|") if k.strip()] if KEYWORDS_ENV else DEFAULT_KEYWORDS
 
 HEADERS = [
     "Job Title",
@@ -53,6 +58,11 @@ HEADERS = [
     "Application Status",
     "Date Added",
 ]
+
+RELATIVE_POSTED_PATTERN = re.compile(
+    r"(?P<number>\d+)\+?\s*(?P<unit>hour|day|week|month|year)s?\s*ago", re.IGNORECASE
+)
+INVALID_SHEET_TITLE_CHARS = re.compile(r"[:\\/?*\[\]]")
 
 
 def log(message: str) -> None:
@@ -98,6 +108,74 @@ def _normalize_job_url(url: str) -> str:
     return url.split("?", 1)[0].rstrip("/")
 
 
+def _worksheet_title_for_keyword(keyword: str) -> str:
+    title = INVALID_SHEET_TITLE_CHARS.sub(" ", keyword).strip()
+    title = " ".join(title.split())
+    return title[:100] if title else "Jobs"
+
+
+def _parse_posted_datetime(posted_value: str, now_utc: datetime) -> datetime | None:
+    if not posted_value:
+        return None
+
+    value = " ".join(posted_value.strip().split())
+    iso_candidate = value
+    if iso_candidate.endswith("Z"):
+        iso_candidate = iso_candidate[:-1] + "+00:00"
+
+    try:
+        parsed_iso = datetime.fromisoformat(iso_candidate)
+        if parsed_iso.tzinfo is not None:
+            return parsed_iso.astimezone(timezone.utc).replace(tzinfo=None)
+        return parsed_iso
+    except ValueError:
+        pass
+
+    try:
+        parsed_date = date.fromisoformat(value[:10])
+        return datetime.combine(parsed_date, datetime.min.time())
+    except ValueError:
+        pass
+
+    normalized = value.lower().replace("reposted", "").replace("posted", "")
+    normalized = " ".join(normalized.split())
+    if "just now" in normalized or "today" in normalized:
+        return now_utc
+    if "yesterday" in normalized:
+        return now_utc - timedelta(days=1)
+
+    match = RELATIVE_POSTED_PATTERN.search(normalized)
+    if not match:
+        return None
+
+    number = int(match.group("number"))
+    unit = match.group("unit").lower()
+
+    if unit == "hour":
+        delta = timedelta(hours=number)
+    elif unit == "day":
+        delta = timedelta(days=number)
+    elif unit == "week":
+        delta = timedelta(weeks=number)
+    elif unit == "month":
+        delta = timedelta(days=number * 30)
+    elif unit == "year":
+        delta = timedelta(days=number * 365)
+    else:
+        return None
+
+    return now_utc - delta
+
+
+def _is_recent_enough(posted_value: str, now_utc: datetime) -> bool:
+    posted_dt = _parse_posted_datetime(posted_value, now_utc)
+    if not posted_dt:
+        return False
+
+    age = now_utc - posted_dt
+    return timedelta(0) <= age <= timedelta(days=MAX_POST_AGE_DAYS)
+
+
 def _safe_text(card, selectors: List[str]) -> str:
     for selector in selectors:
         locator = card.locator(selector).first
@@ -126,8 +204,10 @@ def _safe_attr(card, selectors: List[str], attr_name: str) -> str:
     return ""
 
 
-def scrape_keyword_jobs(page, keyword: str) -> List[Dict[str, str]]:
+def scrape_keyword_jobs(page, keyword: str, now_utc: datetime) -> List[Dict[str, str]]:
     jobs: List[Dict[str, str]] = []
+    skipped_not_recent = 0
+    skipped_missing_url = 0
     log(f"=== Scraping keyword: {keyword} ===")
 
     for page_index in range(MAX_PAGES_PER_KEYWORD):
@@ -173,43 +253,33 @@ def scrape_keyword_jobs(page, keyword: str) -> List[Dict[str, str]]:
                 log(
                     f"Parsed {i}/{card_count} cards on page {page_index + 1} for keyword '{keyword}'"
                 )
+
             card = cards.nth(i)
-            title = _safe_text(
-                card,
-                [
-                    "h3.base-search-card__title",
-                    "h3",
-                ],
-            )
+            title = _safe_text(card, ["h3.base-search-card__title", "h3"])
             company = _safe_text(
                 card,
-                [
-                    "h4.base-search-card__subtitle",
-                    ".base-search-card__subtitle",
-                    "h4",
-                ],
+                ["h4.base-search-card__subtitle", ".base-search-card__subtitle", "h4"],
             )
-            location = _safe_text(
-                card,
-                [
-                    ".job-search-card__location",
-                    ".job-search-card__location-text",
-                ],
-            )
+            location = _safe_text(card, [".job-search-card__location", ".job-search-card__location-text"])
             posted_date = _safe_attr(card, ["time"], "datetime") or _safe_text(
                 card, ["time", ".job-search-card__listdate", ".job-search-card__listdate--new"]
             )
+            if not _is_recent_enough(posted_date, now_utc):
+                skipped_not_recent += 1
+                continue
+
             raw_url = _safe_attr(card, ["a.base-card__full-link", "a[href*='/jobs/view/']"], "href")
             if not raw_url:
+                skipped_missing_url += 1
                 continue
-            job_url = _normalize_job_url(raw_url)
+
             jobs.append(
                 {
                     "title": title,
                     "company": company,
                     "location": location,
                     "date_posted": posted_date,
-                    "job_url": job_url,
+                    "job_url": _normalize_job_url(raw_url),
                     "keyword": keyword,
                 }
             )
@@ -218,7 +288,10 @@ def scrape_keyword_jobs(page, keyword: str) -> List[Dict[str, str]]:
             log("Less than 25 results on page; stopping pagination for this keyword.")
             break
 
-    log(f"Collected {len(jobs)} rows for keyword '{keyword}'")
+    log(
+        f"Collected {len(jobs)} recent rows for '{keyword}'. "
+        f"Skipped old/unknown-date: {skipped_not_recent}, missing URL: {skipped_missing_url}"
+    )
     return jobs
 
 
@@ -241,18 +314,22 @@ def get_gspread_client():
     return gspread.authorize(credentials)
 
 
-def get_jobs_worksheet(client):
+def get_spreadsheet(client):
     if not SHEET_ID:
         raise ValueError("SHEET_ID is not set. Provide it via environment variable.")
 
     log(f"Opening spreadsheet with SHEET_ID: {SHEET_ID}")
-    spreadsheet = client.open_by_key(SHEET_ID)
+    return client.open_by_key(SHEET_ID)
+
+
+def get_keyword_worksheet(spreadsheet, keyword: str):
+    worksheet_title = _worksheet_title_for_keyword(keyword)
     try:
-        worksheet = spreadsheet.worksheet(WORKSHEET_NAME)
-        log(f"Using existing worksheet: {WORKSHEET_NAME}")
+        worksheet = spreadsheet.worksheet(worksheet_title)
+        log(f"Using existing worksheet: {worksheet_title}")
     except WorksheetNotFound:
-        worksheet = spreadsheet.add_worksheet(title=WORKSHEET_NAME, rows=1000, cols=20)
-        log(f"Created worksheet: {WORKSHEET_NAME}")
+        worksheet = spreadsheet.add_worksheet(title=worksheet_title, rows=1000, cols=20)
+        log(f"Created worksheet: {worksheet_title}")
     return worksheet
 
 
@@ -260,36 +337,41 @@ def ensure_headers(worksheet) -> None:
     existing_values = worksheet.get_all_values()
     if not existing_values:
         worksheet.append_row(HEADERS, value_input_option="RAW")
-        log("Header row initialized.")
+        log(f"Header row initialized for tab '{worksheet.title}'.")
         return
 
     first_row = existing_values[0]
     if first_row[: len(HEADERS)] != HEADERS:
         worksheet.update("A1:H1", [HEADERS], value_input_option="RAW")
-        log("Header row updated to expected format.")
+        log(f"Header row updated for tab '{worksheet.title}'.")
 
 
 def get_existing_job_urls(worksheet) -> set[str]:
-    log("Loading existing rows from sheet for deduplication.")
+    log(f"Loading existing rows from tab '{worksheet.title}' for deduplication.")
     rows = worksheet.get_all_values()
     existing_urls = set()
     for row in rows[1:]:
         if len(row) >= 5 and row[4].strip():
             existing_urls.add(_normalize_job_url(row[4].strip()))
-    log(f"Loaded {len(existing_urls)} existing URLs from sheet")
+    log(f"Loaded {len(existing_urls)} existing URLs from tab '{worksheet.title}'")
     return existing_urls
 
 
 def main() -> None:
     log("Scraper started.")
-    client = get_gspread_client()
-    worksheet = get_jobs_worksheet(client)
-    ensure_headers(worksheet)
-    existing_urls = get_existing_job_urls(worksheet)
+    log(
+        f"Keyword source: {'KEYWORDS env var' if KEYWORDS_ENV else 'DEFAULT_KEYWORDS list'}. "
+        f"Total keywords: {len(KEYWORDS)}"
+    )
+    log(f"Date filter: jobs posted within the last {MAX_POST_AGE_DAYS} days.")
 
+    client = get_gspread_client()
+    spreadsheet = get_spreadsheet(client)
     date_added = date.today().isoformat()
-    rows_to_append: List[List[str]] = []
-    skipped_duplicates = 0
+    now_utc = datetime.utcnow()
+
+    total_new_rows = 0
+    total_duplicates_skipped = 0
 
     with sync_playwright() as playwright:
         log("Launching Playwright Chromium in headless mode.")
@@ -303,16 +385,23 @@ def main() -> None:
 
         for idx, keyword in enumerate(KEYWORDS):
             log(f"Starting keyword {idx + 1}/{len(KEYWORDS)}: {keyword}")
-            keyword_jobs = scrape_keyword_jobs(page, keyword)
+
+            worksheet = get_keyword_worksheet(spreadsheet, keyword)
+            ensure_headers(worksheet)
+            existing_urls = get_existing_job_urls(worksheet)
+
+            keyword_jobs = scrape_keyword_jobs(page, keyword, now_utc)
+            keyword_rows_to_append: List[List[str]] = []
+            keyword_duplicates_skipped = 0
 
             for job in keyword_jobs:
                 job_url = job["job_url"]
                 if job_url in existing_urls:
-                    skipped_duplicates += 1
+                    keyword_duplicates_skipped += 1
                     continue
 
                 existing_urls.add(job_url)
-                rows_to_append.append(
+                keyword_rows_to_append.append(
                     [
                         job["title"],
                         job["company"],
@@ -325,11 +414,23 @@ def main() -> None:
                     ]
                 )
 
+            if keyword_rows_to_append:
+                log(
+                    f"Appending {len(keyword_rows_to_append)} rows to tab '{worksheet.title}' "
+                    f"for keyword '{keyword}'."
+                )
+                worksheet.append_rows(keyword_rows_to_append, value_input_option="RAW")
+                log(f"Appended {len(keyword_rows_to_append)} rows to tab '{worksheet.title}'.")
+            else:
+                log(f"No new rows to append for keyword '{keyword}'.")
+
+            total_new_rows += len(keyword_rows_to_append)
+            total_duplicates_skipped += keyword_duplicates_skipped
             log(
-                f"Keyword complete: {keyword}. "
-                f"New rows queued so far: {len(rows_to_append)}. "
-                f"Duplicates skipped so far: {skipped_duplicates}"
+                f"Keyword complete: {keyword}. New rows: {len(keyword_rows_to_append)}. "
+                f"Duplicates skipped: {keyword_duplicates_skipped}"
             )
+
             if idx < len(KEYWORDS) - 1:
                 _sleep_random(KEYWORD_DELAY_RANGE_SECONDS, "between keywords")
 
@@ -337,16 +438,9 @@ def main() -> None:
         browser.close()
         log("Browser session closed.")
 
-    if rows_to_append:
-        log(f"Appending {len(rows_to_append)} new rows to Google Sheet.")
-        worksheet.append_rows(rows_to_append, value_input_option="RAW")
-        log(f"Appended {len(rows_to_append)} new jobs to the sheet.")
-    else:
-        log("No new jobs to append.")
-
     log(
-        f"Scraper finished. Total new rows: {len(rows_to_append)}. "
-        f"Total duplicates skipped: {skipped_duplicates}"
+        f"Scraper finished. Total new rows: {total_new_rows}. "
+        f"Total duplicates skipped: {total_duplicates_skipped}"
     )
 
 

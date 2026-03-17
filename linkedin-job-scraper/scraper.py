@@ -57,7 +57,7 @@ HEADERS = [
     "Job URL",
     "Apply URL",
     "Keyword",
-    "Application Status",
+    "Application Date",
     "Date Added",
 ]
 APPLY_LINK_SELECTORS = [

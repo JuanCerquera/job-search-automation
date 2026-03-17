@@ -1,0 +1,41 @@
+name: LinkedIn Job Scraper
+
+on:
+  schedule:
+    - cron: "0 9 * * *"
+  workflow_dispatch:
+
+jobs:
+  scrape:
+    runs-on: ubuntu-latest
+    env:
+      SHEET_ID: ${{ vars.SHEET_ID }}
+      CREDS_FILE: service_account.json
+    defaults:
+      run:
+        working-directory: linkedin-job-scraper
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install Python dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Install Playwright Chromium and OS dependencies
+        run: python -m playwright install --with-deps chromium
+
+      - name: Write Google service account credentials
+        run: |
+          cat <<'EOF' > service_account.json
+          ${{ vars.GCP_SERVICE_ACCOUNT_JSON }}
+          EOF
+
+      - name: Run scraper
+        run: python scraper.py

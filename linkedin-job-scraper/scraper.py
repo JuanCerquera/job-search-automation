@@ -6,7 +6,7 @@ import time
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from typing import Dict, List
-from urllib.parse import quote_plus
+from urllib.parse import parse_qs, quote_plus, unquote, urljoin, urlparse
 
 import gspread
 from google.auth.transport.requests import Request
@@ -55,9 +55,16 @@ HEADERS = [
     "Location",
     "Date Posted",
     "Job URL",
+    "Apply URL",
     "Keyword",
     "Application Status",
     "Date Added",
+]
+APPLY_LINK_SELECTORS = [
+    "a[data-tracking-control-name='public_jobs_topcard-apply']",
+    "a.top-card-layout__cta--primary",
+    "a.topcard__link",
+    "a[href*='linkedin.com/jobs/view/'][href*='apply']",
 ]
 
 RELATIVE_POSTED_PATTERN = re.compile(
@@ -106,6 +113,50 @@ def _build_search_url(keyword: str, start: int) -> str:
 
 def _normalize_job_url(url: str) -> str:
     return url.split("?", 1)[0].rstrip("/")
+
+
+def _normalize_apply_url(apply_href: str, job_url: str) -> str:
+    cleaned_href = apply_href.strip()
+    if not cleaned_href or cleaned_href.startswith("javascript:") or cleaned_href == "#":
+        return job_url
+
+    absolute_url = urljoin(job_url, cleaned_href)
+    parsed = urlparse(absolute_url)
+    query = parse_qs(parsed.query)
+
+    # LinkedIn sometimes wraps outbound links in query parameters.
+    for key in ("url", "redirect", "redirectUrl", "target"):
+        if key in query and query[key]:
+            return unquote(query[key][0]).strip()
+
+    return absolute_url
+
+
+def resolve_apply_url(detail_page, job_url: str) -> str:
+    try:
+        run_with_heartbeat(
+            action=f"resolving apply URL for job {job_url}",
+            func=detail_page.goto,
+            url=job_url,
+            wait_until="domcontentloaded",
+            timeout=45000,
+        )
+    except PlaywrightTimeoutError:
+        log(f"Timed out opening job detail page for apply URL: {job_url}")
+        return job_url
+
+    for selector in APPLY_LINK_SELECTORS:
+        link = detail_page.locator(selector).first
+        try:
+            if link.count() == 0:
+                continue
+            href = link.get_attribute("href", timeout=1500)
+            if href:
+                return _normalize_apply_url(href, job_url)
+        except Exception:
+            continue
+
+    return job_url
 
 
 def _parse_posted_datetime(posted_value: str, now_utc: datetime) -> datetime | None:
@@ -335,7 +386,7 @@ def ensure_headers(worksheet) -> None:
 
     first_row = existing_values[0]
     if first_row[: len(HEADERS)] != HEADERS:
-        worksheet.update("A1:H1", [HEADERS], value_input_option="RAW")
+        worksheet.update("A1:I1", [HEADERS], value_input_option="RAW")
         log(f"Header row updated for tab '{worksheet.title}'.")
 
 
@@ -378,6 +429,7 @@ def main() -> None:
             viewport={"width": 1366, "height": 768},
         )
         page = context.new_page()
+        detail_page = context.new_page()
 
         for idx, keyword in enumerate(KEYWORDS):
             log(f"Starting keyword {idx + 1}/{len(KEYWORDS)}: {keyword}")
@@ -393,6 +445,7 @@ def main() -> None:
                     continue
 
                 existing_urls.add(job_url)
+                apply_url = resolve_apply_url(detail_page, job_url)
                 keyword_rows_to_append.append(
                     [
                         job["title"],
@@ -400,6 +453,7 @@ def main() -> None:
                         job["location"],
                         job["date_posted"],
                         job_url,
+                        apply_url,
                         keyword,
                         "",
                         date_added,

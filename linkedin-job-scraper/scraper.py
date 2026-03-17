@@ -101,14 +101,14 @@ KEYWORDS_ENV = os.getenv("KEYWORDS", "").strip()
 KEYWORDS = [k.strip() for k in KEYWORDS_ENV.split("|") if k.strip()] if KEYWORDS_ENV else DEFAULT_KEYWORDS
 
 HEADERS = [
+    "Job URL",
+    "Application Date",
     "Job Title",
     "Company",
     "Location",
     "Date Posted",
-    "Job URL",
     "Apply URL",
     "Keyword",
-    "Application Date",
     "Date Added",
 ]
 APPLY_LINK_SELECTORS = [
@@ -445,9 +445,24 @@ def get_existing_job_urls(worksheet) -> set[str]:
     log(f"Loading existing rows from tab '{worksheet.title}' for deduplication.")
     rows = worksheet.get_all_values()
     existing_urls = set()
+
+    def extract_job_url_from_row(row: List[str]) -> str:
+        # Current layout keeps Job URL in column A. Fall back to legacy column E
+        # so dedupe still works for rows written before the column reorder.
+        candidates = []
+        if row:
+            candidates.append(row[0].strip())
+        if len(row) >= 5:
+            candidates.append(row[4].strip())
+        for candidate in candidates:
+            if "/jobs/view/" in candidate:
+                return candidate
+        return ""
+
     for row in rows[1:]:
-        if len(row) >= 5 and row[4].strip():
-            existing_urls.add(_normalize_job_url(row[4].strip()))
+        extracted_job_url = extract_job_url_from_row(row)
+        if extracted_job_url:
+            existing_urls.add(_normalize_job_url(extracted_job_url))
     log(f"Loaded {len(existing_urls)} existing URLs from tab '{worksheet.title}'")
     return existing_urls
 
@@ -506,14 +521,14 @@ def main() -> None:
                 apply_url = resolve_apply_url(detail_page, job_url)
                 keyword_rows_to_append.append(
                     [
+                        job_url,
+                        "",
                         job["title"],
                         job["company"],
                         job["location"],
                         job["date_posted"],
-                        job_url,
                         apply_url,
                         keyword,
-                        "",
                         date_added,
                     ]
                 )

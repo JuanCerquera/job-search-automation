@@ -17,6 +17,7 @@ from playwright.sync_api import sync_playwright
 
 SHEET_ID = os.getenv("SHEET_ID", "").strip()
 CREDS_FILE = os.getenv("CREDS_FILE", "service_account.json").strip()
+WORKSHEET_NAME = "Jobs"
 
 RESULTS_PER_PAGE = 25
 MAX_PAGES_PER_KEYWORD = 3
@@ -62,7 +63,6 @@ HEADERS = [
 RELATIVE_POSTED_PATTERN = re.compile(
     r"(?P<number>\d+)\+?\s*(?P<unit>hour|day|week|month|year)s?\s*ago", re.IGNORECASE
 )
-INVALID_SHEET_TITLE_CHARS = re.compile(r"[:\\/?*\[\]]")
 
 
 def log(message: str) -> None:
@@ -106,12 +106,6 @@ def _build_search_url(keyword: str, start: int) -> str:
 
 def _normalize_job_url(url: str) -> str:
     return url.split("?", 1)[0].rstrip("/")
-
-
-def _worksheet_title_for_keyword(keyword: str) -> str:
-    title = INVALID_SHEET_TITLE_CHARS.sub(" ", keyword).strip()
-    title = " ".join(title.split())
-    return title[:100] if title else "Jobs"
 
 
 def _parse_posted_datetime(posted_value: str, now_utc: datetime) -> datetime | None:
@@ -322,14 +316,13 @@ def get_spreadsheet(client):
     return client.open_by_key(SHEET_ID)
 
 
-def get_keyword_worksheet(spreadsheet, keyword: str):
-    worksheet_title = _worksheet_title_for_keyword(keyword)
+def get_jobs_worksheet(spreadsheet):
     try:
-        worksheet = spreadsheet.worksheet(worksheet_title)
-        log(f"Using existing worksheet: {worksheet_title}")
+        worksheet = spreadsheet.worksheet(WORKSHEET_NAME)
+        log(f"Using existing worksheet: {WORKSHEET_NAME}")
     except WorksheetNotFound:
-        worksheet = spreadsheet.add_worksheet(title=worksheet_title, rows=1000, cols=20)
-        log(f"Created worksheet: {worksheet_title}")
+        worksheet = spreadsheet.add_worksheet(title=WORKSHEET_NAME, rows=1000, cols=20)
+        log(f"Created worksheet: {WORKSHEET_NAME}")
     return worksheet
 
 
@@ -367,6 +360,9 @@ def main() -> None:
 
     client = get_gspread_client()
     spreadsheet = get_spreadsheet(client)
+    worksheet = get_jobs_worksheet(spreadsheet)
+    ensure_headers(worksheet)
+    existing_urls = get_existing_job_urls(worksheet)
     date_added = date.today().isoformat()
     now_utc = datetime.utcnow()
 
@@ -385,10 +381,6 @@ def main() -> None:
 
         for idx, keyword in enumerate(KEYWORDS):
             log(f"Starting keyword {idx + 1}/{len(KEYWORDS)}: {keyword}")
-
-            worksheet = get_keyword_worksheet(spreadsheet, keyword)
-            ensure_headers(worksheet)
-            existing_urls = get_existing_job_urls(worksheet)
 
             keyword_jobs = scrape_keyword_jobs(page, keyword, now_utc)
             keyword_rows_to_append: List[List[str]] = []

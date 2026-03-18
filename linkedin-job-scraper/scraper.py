@@ -117,6 +117,12 @@ APPLY_LINK_SELECTORS = [
     "a.topcard__link",
     "a[href*='linkedin.com/jobs/view/'][href*='apply']",
 ]
+JOB_CARD_SELECTOR = "li:has(a.base-card__full-link)"
+NO_RESULTS_SELECTOR = (
+    ".jobs-search-no-results-banner, "
+    ".jobs-search-no-results__image, "
+    "h1:has-text('No matching jobs found')"
+)
 
 RELATIVE_POSTED_PATTERN = re.compile(
     r"(?P<number>\d+)\+?\s*(?P<unit>hour|day|week|month|year)s?\s*ago", re.IGNORECASE
@@ -156,9 +162,10 @@ def _sleep_random(delay_range: tuple[float, float], reason: str) -> None:
 
 def _build_search_url(keyword: str, start: int) -> str:
     keyword_encoded = quote_plus(keyword)
+    max_age_seconds = MAX_POST_AGE_DAYS * 24 * 60 * 60
     return (
         "https://www.linkedin.com/jobs/search/"
-        f"?keywords={keyword_encoded}&sortBy=DD&start={start}"
+        f"?keywords={keyword_encoded}&sortBy=DD&f_TPR=r{max_age_seconds}&start={start}"
     )
 
 
@@ -263,13 +270,15 @@ def _parse_posted_datetime(posted_value: str, now_utc: datetime) -> datetime | N
     return now_utc - delta
 
 
-def _is_recent_enough(posted_value: str, now_utc: datetime) -> bool:
+def _is_recent_enough(posted_value: str, now_utc: datetime) -> tuple[bool, bool]:
     posted_dt = _parse_posted_datetime(posted_value, now_utc)
     if not posted_dt:
-        return False
+        # Keep rows with unknown posted text because LinkedIn search URL already
+        # applies the f_TPR recency filter.
+        return True, True
 
     age = now_utc - posted_dt
-    return timedelta(0) <= age <= timedelta(days=MAX_POST_AGE_DAYS)
+    return timedelta(0) <= age <= timedelta(days=MAX_POST_AGE_DAYS), False
 
 
 def _safe_text(card, selectors: List[str]) -> str:
@@ -302,7 +311,8 @@ def _safe_attr(card, selectors: List[str], attr_name: str) -> str:
 
 def scrape_keyword_jobs(page, keyword: str, now_utc: datetime) -> List[Dict[str, str]]:
     jobs: List[Dict[str, str]] = []
-    skipped_not_recent = 0
+    skipped_old = 0
+    kept_unknown_date = 0
     skipped_missing_url = 0
     log(f"=== Scraping keyword: {keyword} ===")
 
@@ -326,24 +336,55 @@ def scrape_keyword_jobs(page, keyword: str, now_utc: datetime) -> List[Dict[str,
             log(f"Timed out loading search page for keyword '{keyword}', start={start}")
             continue
 
-        try:
-            log(f"Waiting for job cards on page {page_index + 1} for keyword '{keyword}'")
-            run_with_heartbeat(
-                action=f"waiting for job cards on page {page_index + 1} for keyword '{keyword}'",
-                func=page.wait_for_selector,
-                selector="ul.jobs-search__results-list li",
-                timeout=15000,
-            )
-        except PlaywrightTimeoutError:
-            log(f"No job list found for keyword '{keyword}', page {page_index + 1}")
-            break
+        card_wait_succeeded = False
+        no_results_found = False
+        for attempt in range(2):
+            try:
+                log(f"Waiting for job cards on page {page_index + 1} for keyword '{keyword}'")
+                run_with_heartbeat(
+                    action=f"waiting for job cards on page {page_index + 1} for keyword '{keyword}'",
+                    func=page.wait_for_selector,
+                    selector=JOB_CARD_SELECTOR,
+                    timeout=15000,
+                )
+                card_wait_succeeded = True
+                break
+            except PlaywrightTimeoutError:
+                if page.locator(NO_RESULTS_SELECTOR).count() > 0:
+                    log(f"No matching jobs found for keyword '{keyword}', page {page_index + 1}")
+                    no_results_found = True
+                    break
+                if attempt == 0:
+                    log(
+                        f"Card wait timed out for keyword '{keyword}', page {page_index + 1}. "
+                        "Reloading once."
+                    )
+                    try:
+                        run_with_heartbeat(
+                            action=(
+                                f"reloading page {page_index + 1} "
+                                f"for keyword '{keyword}' after card wait timeout"
+                            ),
+                            func=page.reload,
+                            wait_until="domcontentloaded",
+                            timeout=60000,
+                        )
+                    except PlaywrightTimeoutError:
+                        break
 
-        cards = page.locator("ul.jobs-search__results-list li")
+        if no_results_found:
+            break
+        if not card_wait_succeeded:
+            log(f"No job list found for keyword '{keyword}', page {page_index + 1}")
+            continue
+
+        cards = page.locator(JOB_CARD_SELECTOR)
         card_count = cards.count()
         log(f"Found {card_count} cards on page {page_index + 1}")
         if card_count == 0:
             break
 
+        page_seen_urls = set()
         for i in range(card_count):
             if i > 0 and i % 10 == 0:
                 log(
@@ -360,8 +401,11 @@ def scrape_keyword_jobs(page, keyword: str, now_utc: datetime) -> List[Dict[str,
             posted_date = _safe_attr(card, ["time"], "datetime") or _safe_text(
                 card, ["time", ".job-search-card__listdate", ".job-search-card__listdate--new"]
             )
-            if not _is_recent_enough(posted_date, now_utc):
-                skipped_not_recent += 1
+            is_recent, is_unknown_date = _is_recent_enough(posted_date, now_utc)
+            if is_unknown_date:
+                kept_unknown_date += 1
+            if not is_recent:
+                skipped_old += 1
                 continue
 
             raw_url = _safe_attr(card, ["a.base-card__full-link", "a[href*='/jobs/view/']"], "href")
@@ -369,13 +413,18 @@ def scrape_keyword_jobs(page, keyword: str, now_utc: datetime) -> List[Dict[str,
                 skipped_missing_url += 1
                 continue
 
+            normalized_job_url = _normalize_job_url(raw_url)
+            if normalized_job_url in page_seen_urls:
+                continue
+            page_seen_urls.add(normalized_job_url)
+
             jobs.append(
                 {
                     "title": title,
                     "company": company,
                     "location": location,
                     "date_posted": posted_date,
-                    "job_url": _normalize_job_url(raw_url),
+                    "job_url": normalized_job_url,
                     "keyword": keyword,
                 }
             )
@@ -386,7 +435,8 @@ def scrape_keyword_jobs(page, keyword: str, now_utc: datetime) -> List[Dict[str,
 
     log(
         f"Collected {len(jobs)} recent rows for '{keyword}'. "
-        f"Skipped old/unknown-date: {skipped_not_recent}, missing URL: {skipped_missing_url}"
+        f"Skipped old: {skipped_old}, kept unknown-date: {kept_unknown_date}, "
+        f"missing URL: {skipped_missing_url}"
     )
     return jobs
 
@@ -437,7 +487,7 @@ def ensure_headers(worksheet) -> None:
 
     first_row = existing_values[0]
     if first_row[: len(HEADERS)] != HEADERS:
-        worksheet.update("A1:I1", [HEADERS], value_input_option="RAW")
+        worksheet.update(range_name="A1:I1", values=[HEADERS], value_input_option="RAW")
         log(f"Header row updated for tab '{worksheet.title}'.")
 
 

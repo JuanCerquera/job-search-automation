@@ -17,6 +17,14 @@ jobs:
       PAGE_DELAY_RANGE_SECONDS: ${{ vars.PAGE_DELAY_RANGE_SECONDS }}
       KEYWORD_DELAY_RANGE_SECONDS: ${{ vars.KEYWORD_DELAY_RANGE_SECONDS }}
       HEARTBEAT_INTERVAL_SECONDS: ${{ vars.HEARTBEAT_INTERVAL_SECONDS }}
+      RUN_SUMMARY_FILE: scraper_run_summary.json
+      SMTP_HOST: ${{ vars.SMTP_HOST }}
+      SMTP_PORT: ${{ vars.SMTP_PORT }}
+      SMTP_USERNAME: ${{ vars.SMTP_USERNAME }}
+      SMTP_PASSWORD: ${{ vars.SMTP_PASSWORD }}
+      SMTP_FROM_EMAIL: ${{ vars.SMTP_FROM_EMAIL }}
+      SMTP_TO_EMAIL: ${{ vars.SMTP_TO_EMAIL }}
+      SMTP_USE_STARTTLS: ${{ vars.SMTP_USE_STARTTLS }}
       PYTHONUNBUFFERED: "1"
     defaults:
       run:
@@ -46,3 +54,9 @@ jobs:
 
       - name: Run scraper
         run: python -u scraper.py
+
+      - name: Send run email notification
+        if: always()
+        env:
+          RUN_STATUS: ${{ job.status }}
+        run: python -u send_notification.py

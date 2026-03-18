@@ -3,9 +3,11 @@ import random
 import re
 import threading
 import time
+import json
+import traceback
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
-from typing import Dict, List, Tuple
+from typing import Dict, List, Tuple, Any
 from urllib.parse import parse_qs, quote_plus, unquote, urljoin, urlparse
 
 import gspread
@@ -18,6 +20,7 @@ from playwright.sync_api import sync_playwright
 SHEET_ID = os.getenv("SHEET_ID", "").strip()
 CREDS_FILE = os.getenv("CREDS_FILE", "service_account.json").strip()
 WORKSHEET_NAME = "Jobs"
+RUN_SUMMARY_FILE = os.getenv("RUN_SUMMARY_FILE", "scraper_run_summary.json").strip()
 
 RESULTS_PER_PAGE = 25
 
@@ -132,6 +135,13 @@ RELATIVE_POSTED_PATTERN = re.compile(
 def log(message: str) -> None:
     timestamp = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S UTC")
     print(f"[{timestamp}] {message}", flush=True)
+
+
+def write_run_summary(summary: Dict[str, Any]) -> None:
+    summary_path = Path(RUN_SUMMARY_FILE)
+    summary_path.parent.mkdir(parents=True, exist_ok=True)
+    summary_path.write_text(json.dumps(summary, indent=2), encoding="utf-8")
+    log(f"Run summary written to {summary_path.as_posix()}")
 
 
 def run_with_heartbeat(action: str, func, *args, **kwargs):
@@ -309,11 +319,14 @@ def _safe_attr(card, selectors: List[str], attr_name: str) -> str:
     return ""
 
 
-def scrape_keyword_jobs(page, keyword: str, now_utc: datetime) -> List[Dict[str, str]]:
+def scrape_keyword_jobs(page, keyword: str, now_utc: datetime) -> tuple[List[Dict[str, str]], Dict[str, Any]]:
     jobs: List[Dict[str, str]] = []
     skipped_old = 0
     kept_unknown_date = 0
     skipped_missing_url = 0
+    no_results_pages = 0
+    page_timeouts = 0
+    pages_scanned = 0
     log(f"=== Scraping keyword: {keyword} ===")
 
     for page_index in range(MAX_PAGES_PER_KEYWORD):
@@ -334,6 +347,7 @@ def scrape_keyword_jobs(page, keyword: str, now_utc: datetime) -> List[Dict[str,
             )
         except PlaywrightTimeoutError:
             log(f"Timed out loading search page for keyword '{keyword}', start={start}")
+            page_timeouts += 1
             continue
 
         card_wait_succeeded = False
@@ -373,13 +387,16 @@ def scrape_keyword_jobs(page, keyword: str, now_utc: datetime) -> List[Dict[str,
                         break
 
         if no_results_found:
+            no_results_pages += 1
             break
         if not card_wait_succeeded:
             log(f"No job list found for keyword '{keyword}', page {page_index + 1}")
+            page_timeouts += 1
             continue
 
         cards = page.locator(JOB_CARD_SELECTOR)
         card_count = cards.count()
+        pages_scanned += 1
         log(f"Found {card_count} cards on page {page_index + 1}")
         if card_count == 0:
             break
@@ -438,7 +455,16 @@ def scrape_keyword_jobs(page, keyword: str, now_utc: datetime) -> List[Dict[str,
         f"Skipped old: {skipped_old}, kept unknown-date: {kept_unknown_date}, "
         f"missing URL: {skipped_missing_url}"
     )
-    return jobs
+    return jobs, {
+        "keyword": keyword,
+        "pages_scanned": pages_scanned,
+        "page_timeouts": page_timeouts,
+        "no_results_pages": no_results_pages,
+        "rows_collected": len(jobs),
+        "skipped_old": skipped_old,
+        "kept_unknown_date": kept_unknown_date,
+        "missing_url": skipped_missing_url,
+    }
 
 
 def get_gspread_client():
@@ -518,6 +544,39 @@ def get_existing_job_urls(worksheet) -> set[str]:
 
 
 def main() -> None:
+    started_at = datetime.utcnow()
+    summary: Dict[str, Any] = {
+        "status": "running",
+        "started_at_utc": started_at.isoformat() + "Z",
+        "finished_at_utc": "",
+        "duration_seconds": 0.0,
+        "sheet_id": SHEET_ID,
+        "worksheet_name": WORKSHEET_NAME,
+        "keyword_source": "KEYWORDS env var" if KEYWORDS_ENV else "DEFAULT_KEYWORDS list",
+        "keywords_total": len(KEYWORDS),
+        "keywords_processed": 0,
+        "runtime_config": {
+            "MAX_PAGES_PER_KEYWORD": MAX_PAGES_PER_KEYWORD,
+            "MAX_POST_AGE_DAYS": MAX_POST_AGE_DAYS,
+            "PAGE_DELAY_RANGE_SECONDS": list(PAGE_DELAY_RANGE_SECONDS),
+            "KEYWORD_DELAY_RANGE_SECONDS": list(KEYWORD_DELAY_RANGE_SECONDS),
+            "HEARTBEAT_INTERVAL_SECONDS": HEARTBEAT_INTERVAL_SECONDS,
+        },
+        "totals": {
+            "rows_collected_before_dedupe": 0,
+            "new_rows_appended": 0,
+            "duplicates_skipped": 0,
+            "skipped_old": 0,
+            "kept_unknown_date": 0,
+            "missing_url": 0,
+            "page_timeouts": 0,
+            "no_results_pages": 0,
+        },
+        "keywords": [],
+        "error": "",
+        "traceback": "",
+    }
+
     log("Scraper started.")
     log(
         f"Keyword source: {'KEYWORDS env var' if KEYWORDS_ENV else 'DEFAULT_KEYWORDS list'}. "
@@ -531,86 +590,118 @@ def main() -> None:
         f"KEYWORD_DELAY_RANGE_SECONDS={KEYWORD_DELAY_RANGE_SECONDS[0]}-{KEYWORD_DELAY_RANGE_SECONDS[1]}, "
         f"HEARTBEAT_INTERVAL_SECONDS={HEARTBEAT_INTERVAL_SECONDS}"
     )
+    try:
+        client = get_gspread_client()
+        spreadsheet = get_spreadsheet(client)
+        worksheet = get_jobs_worksheet(spreadsheet)
+        ensure_headers(worksheet)
+        existing_urls = get_existing_job_urls(worksheet)
+        date_added = date.today().isoformat()
+        now_utc = datetime.utcnow()
 
-    client = get_gspread_client()
-    spreadsheet = get_spreadsheet(client)
-    worksheet = get_jobs_worksheet(spreadsheet)
-    ensure_headers(worksheet)
-    existing_urls = get_existing_job_urls(worksheet)
-    date_added = date.today().isoformat()
-    now_utc = datetime.utcnow()
+        total_new_rows = 0
+        total_duplicates_skipped = 0
 
-    total_new_rows = 0
-    total_duplicates_skipped = 0
-
-    with sync_playwright() as playwright:
-        log("Launching Playwright Chromium in headless mode.")
-        browser = playwright.chromium.launch(headless=True)
-        context = browser.new_context(
-            user_agent=USER_AGENT,
-            locale="en-US",
-            viewport={"width": 1366, "height": 768},
-        )
-        page = context.new_page()
-        detail_page = context.new_page()
-
-        for idx, keyword in enumerate(KEYWORDS):
-            log(f"Starting keyword {idx + 1}/{len(KEYWORDS)}: {keyword}")
-
-            keyword_jobs = scrape_keyword_jobs(page, keyword, now_utc)
-            keyword_rows_to_append: List[List[str]] = []
-            keyword_duplicates_skipped = 0
-
-            for job in keyword_jobs:
-                job_url = job["job_url"]
-                if job_url in existing_urls:
-                    keyword_duplicates_skipped += 1
-                    continue
-
-                existing_urls.add(job_url)
-                apply_url = resolve_apply_url(detail_page, job_url)
-                keyword_rows_to_append.append(
-                    [
-                        job_url,
-                        "",
-                        job["title"],
-                        job["company"],
-                        job["location"],
-                        job["date_posted"],
-                        apply_url,
-                        keyword,
-                        date_added,
-                    ]
-                )
-
-            if keyword_rows_to_append:
-                log(
-                    f"Appending {len(keyword_rows_to_append)} rows to tab '{worksheet.title}' "
-                    f"for keyword '{keyword}'."
-                )
-                worksheet.append_rows(keyword_rows_to_append, value_input_option="RAW")
-                log(f"Appended {len(keyword_rows_to_append)} rows to tab '{worksheet.title}'.")
-            else:
-                log(f"No new rows to append for keyword '{keyword}'.")
-
-            total_new_rows += len(keyword_rows_to_append)
-            total_duplicates_skipped += keyword_duplicates_skipped
-            log(
-                f"Keyword complete: {keyword}. New rows: {len(keyword_rows_to_append)}. "
-                f"Duplicates skipped: {keyword_duplicates_skipped}"
+        with sync_playwright() as playwright:
+            log("Launching Playwright Chromium in headless mode.")
+            browser = playwright.chromium.launch(headless=True)
+            context = browser.new_context(
+                user_agent=USER_AGENT,
+                locale="en-US",
+                viewport={"width": 1366, "height": 768},
             )
+            page = context.new_page()
+            detail_page = context.new_page()
 
-            if idx < len(KEYWORDS) - 1:
-                _sleep_random(KEYWORD_DELAY_RANGE_SECONDS, "between keywords")
+            for idx, keyword in enumerate(KEYWORDS):
+                log(f"Starting keyword {idx + 1}/{len(KEYWORDS)}: {keyword}")
 
-        context.close()
-        browser.close()
-        log("Browser session closed.")
+                keyword_jobs, keyword_stats = scrape_keyword_jobs(page, keyword, now_utc)
+                keyword_rows_to_append: List[List[str]] = []
+                keyword_duplicates_skipped = 0
 
-    log(
-        f"Scraper finished. Total new rows: {total_new_rows}. "
-        f"Total duplicates skipped: {total_duplicates_skipped}"
-    )
+                for job in keyword_jobs:
+                    job_url = job["job_url"]
+                    if job_url in existing_urls:
+                        keyword_duplicates_skipped += 1
+                        continue
+
+                    existing_urls.add(job_url)
+                    apply_url = resolve_apply_url(detail_page, job_url)
+                    keyword_rows_to_append.append(
+                        [
+                            job_url,
+                            "",
+                            job["title"],
+                            job["company"],
+                            job["location"],
+                            job["date_posted"],
+                            apply_url,
+                            keyword,
+                            date_added,
+                        ]
+                    )
+
+                if keyword_rows_to_append:
+                    log(
+                        f"Appending {len(keyword_rows_to_append)} rows to tab '{worksheet.title}' "
+                        f"for keyword '{keyword}'."
+                    )
+                    worksheet.append_rows(keyword_rows_to_append, value_input_option="RAW")
+                    log(f"Appended {len(keyword_rows_to_append)} rows to tab '{worksheet.title}'.")
+                else:
+                    log(f"No new rows to append for keyword '{keyword}'.")
+
+                total_new_rows += len(keyword_rows_to_append)
+                total_duplicates_skipped += keyword_duplicates_skipped
+                summary["keywords"].append(
+                    {
+                        **keyword_stats,
+                        "new_rows_appended": len(keyword_rows_to_append),
+                        "duplicates_skipped": keyword_duplicates_skipped,
+                    }
+                )
+                summary["keywords_processed"] = len(summary["keywords"])
+
+                log(
+                    f"Keyword complete: {keyword}. New rows: {len(keyword_rows_to_append)}. "
+                    f"Duplicates skipped: {keyword_duplicates_skipped}"
+                )
+
+                if idx < len(KEYWORDS) - 1:
+                    _sleep_random(KEYWORD_DELAY_RANGE_SECONDS, "between keywords")
+
+            context.close()
+            browser.close()
+            log("Browser session closed.")
+
+        summary["totals"] = {
+            "rows_collected_before_dedupe": sum(int(item["rows_collected"]) for item in summary["keywords"]),
+            "new_rows_appended": total_new_rows,
+            "duplicates_skipped": total_duplicates_skipped,
+            "skipped_old": sum(int(item["skipped_old"]) for item in summary["keywords"]),
+            "kept_unknown_date": sum(int(item["kept_unknown_date"]) for item in summary["keywords"]),
+            "missing_url": sum(int(item["missing_url"]) for item in summary["keywords"]),
+            "page_timeouts": sum(int(item["page_timeouts"]) for item in summary["keywords"]),
+            "no_results_pages": sum(int(item["no_results_pages"]) for item in summary["keywords"]),
+        }
+        summary["status"] = "success"
+
+        log(
+            f"Scraper finished. Total new rows: {total_new_rows}. "
+            f"Total duplicates skipped: {total_duplicates_skipped}"
+        )
+    except Exception as exc:
+        summary["status"] = "failed"
+        summary["error"] = str(exc)
+        summary["traceback"] = traceback.format_exc()
+        log(f"Scraper failed: {exc}")
+        raise
+    finally:
+        finished_at = datetime.utcnow()
+        summary["finished_at_utc"] = finished_at.isoformat() + "Z"
+        summary["duration_seconds"] = round((finished_at - started_at).total_seconds(), 2)
+        write_run_summary(summary)
 
 
 if __name__ == "__main__":

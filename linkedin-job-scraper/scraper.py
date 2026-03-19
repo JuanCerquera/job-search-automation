@@ -75,25 +75,11 @@ def _parse_range_env(name: str, default: Tuple[float, float]) -> Tuple[float, fl
     return default
 
 
-def _parse_terms_env(name: str, default: List[str]) -> List[str]:
-    raw_value = os.getenv(name, "").strip()
-    if not raw_value:
-        return default
-
-    normalized = raw_value.replace(";", "|").replace(",", "|")
-    terms = [item.strip().lower() for item in normalized.split("|") if item.strip()]
-    if not terms:
-        return default
-    return terms
-
-
 MAX_PAGES_PER_KEYWORD = _parse_positive_int_env("MAX_PAGES_PER_KEYWORD", 3)
 MAX_POST_AGE_DAYS = _parse_positive_int_env("MAX_POST_AGE_DAYS", 14)
 PAGE_DELAY_RANGE_SECONDS = _parse_range_env("PAGE_DELAY_RANGE_SECONDS", (2.0, 4.0))
 KEYWORD_DELAY_RANGE_SECONDS = _parse_range_env("KEYWORD_DELAY_RANGE_SECONDS", (3.0, 6.0))
 HEARTBEAT_INTERVAL_SECONDS = _parse_positive_int_env("HEARTBEAT_INTERVAL_SECONDS", 5)
-REQUIRED_ALL_TERMS = _parse_terms_env("REQUIRED_ALL_TERMS", ["robot"])
-REQUIRED_ANY_TERMS = _parse_terms_env("REQUIRED_ANY_TERMS", ["intern", "co-op", "junior"])
 TITLE_FILTER_EXPRESSION = os.getenv("TITLE_FILTER_EXPRESSION", "").strip()
 USER_AGENT = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
@@ -334,20 +320,9 @@ def _title_matches_term_filters(title: str) -> bool:
     title_lower = title.lower()
     title_compact = _normalized_text_for_term_matching(title)
     expression_ast = _get_title_filter_ast()
-    if expression_ast is not None:
-        return _evaluate_filter_ast(expression_ast, title_lower, title_compact)
-
-    all_ok = (
-        all(_term_matches_title(term, title_lower, title_compact) for term in REQUIRED_ALL_TERMS)
-        if REQUIRED_ALL_TERMS
-        else True
-    )
-    any_ok = (
-        any(_term_matches_title(term, title_lower, title_compact) for term in REQUIRED_ANY_TERMS)
-        if REQUIRED_ANY_TERMS
-        else True
-    )
-    return all_ok and any_ok
+    if expression_ast is None:
+        return True
+    return _evaluate_filter_ast(expression_ast, title_lower, title_compact)
 
 
 def _normalize_apply_url(apply_href: str, job_url: str) -> str:
@@ -734,8 +709,6 @@ def main() -> None:
             "KEYWORD_DELAY_RANGE_SECONDS": list(KEYWORD_DELAY_RANGE_SECONDS),
             "HEARTBEAT_INTERVAL_SECONDS": HEARTBEAT_INTERVAL_SECONDS,
             "TITLE_FILTER_EXPRESSION": TITLE_FILTER_EXPRESSION,
-            "REQUIRED_ALL_TERMS": REQUIRED_ALL_TERMS,
-            "REQUIRED_ANY_TERMS": REQUIRED_ANY_TERMS,
         },
         "totals": {
             "rows_collected_before_dedupe": 0,
@@ -769,9 +742,7 @@ def main() -> None:
         f"PAGE_DELAY_RANGE_SECONDS={PAGE_DELAY_RANGE_SECONDS[0]}-{PAGE_DELAY_RANGE_SECONDS[1]}, "
         f"KEYWORD_DELAY_RANGE_SECONDS={KEYWORD_DELAY_RANGE_SECONDS[0]}-{KEYWORD_DELAY_RANGE_SECONDS[1]}, "
         f"HEARTBEAT_INTERVAL_SECONDS={HEARTBEAT_INTERVAL_SECONDS}, "
-        f"TITLE_FILTER_EXPRESSION={TITLE_FILTER_EXPRESSION or '<not set>'}, "
-        f"REQUIRED_ALL_TERMS={REQUIRED_ALL_TERMS}, "
-        f"REQUIRED_ANY_TERMS={REQUIRED_ANY_TERMS}"
+        f"TITLE_FILTER_EXPRESSION={TITLE_FILTER_EXPRESSION or '<not set>'}"
     )
     try:
         client = get_gspread_client()

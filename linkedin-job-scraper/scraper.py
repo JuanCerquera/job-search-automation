@@ -6,6 +6,7 @@ import time
 import json
 import traceback
 from datetime import date, datetime, timedelta, timezone
+from functools import lru_cache
 from pathlib import Path
 from typing import Dict, List, Tuple, Any
 from urllib.parse import parse_qs, quote_plus, unquote, urljoin, urlparse
@@ -93,6 +94,7 @@ KEYWORD_DELAY_RANGE_SECONDS = _parse_range_env("KEYWORD_DELAY_RANGE_SECONDS", (3
 HEARTBEAT_INTERVAL_SECONDS = _parse_positive_int_env("HEARTBEAT_INTERVAL_SECONDS", 5)
 REQUIRED_ALL_TERMS = _parse_terms_env("REQUIRED_ALL_TERMS", ["robot"])
 REQUIRED_ANY_TERMS = _parse_terms_env("REQUIRED_ANY_TERMS", ["intern", "co-op", "junior"])
+TITLE_FILTER_EXPRESSION = os.getenv("TITLE_FILTER_EXPRESSION", "").strip()
 USER_AGENT = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
     "AppleWebKit/537.36 (KHTML, like Gecko) "
@@ -201,20 +203,150 @@ def _normalized_text_for_term_matching(value: str) -> str:
     return re.sub(r"[^a-z0-9]+", "", value.lower())
 
 
+def _term_matches_title(term: str, title_lower: str, title_compact: str) -> bool:
+    term_lower = term.lower().strip()
+    if not term_lower:
+        return False
+    if term_lower in title_lower:
+        return True
+    return _normalized_text_for_term_matching(term_lower) in title_compact
+
+
+def _tokenize_filter_expression(expression: str) -> List[str]:
+    tokens: List[str] = []
+    i = 0
+    while i < len(expression):
+        ch = expression[i]
+        if ch.isspace():
+            i += 1
+            continue
+        if ch in ("(", ")", "&", "|"):
+            tokens.append(ch)
+            i += 1
+            continue
+        if ch in ("'", '"'):
+            quote = ch
+            i += 1
+            start = i
+            while i < len(expression) and expression[i] != quote:
+                i += 1
+            if i >= len(expression):
+                raise ValueError("Unclosed quote in TITLE_FILTER_EXPRESSION")
+            tokens.append(expression[start:i].strip())
+            i += 1
+            continue
+
+        start = i
+        while i < len(expression) and (not expression[i].isspace()) and expression[i] not in "()&|":
+            i += 1
+        tokens.append(expression[start:i].strip())
+
+    return [t for t in tokens if t]
+
+
+class _ExprParser:
+    def __init__(self, tokens: List[str]):
+        self.tokens = tokens
+        self.pos = 0
+
+    def _peek(self) -> str:
+        if self.pos >= len(self.tokens):
+            return ""
+        return self.tokens[self.pos]
+
+    def _consume(self, expected: str | None = None) -> str:
+        token = self._peek()
+        if not token:
+            raise ValueError("Unexpected end of TITLE_FILTER_EXPRESSION")
+        if expected is not None and token != expected:
+            raise ValueError(
+                f"Expected '{expected}' in TITLE_FILTER_EXPRESSION, found '{token}'"
+            )
+        self.pos += 1
+        return token
+
+    def parse(self):
+        node = self._parse_or()
+        if self._peek():
+            raise ValueError(
+                f"Unexpected token '{self._peek()}' in TITLE_FILTER_EXPRESSION"
+            )
+        return node
+
+    def _parse_or(self):
+        node = self._parse_and()
+        while self._peek() == "|":
+            self._consume("|")
+            right = self._parse_and()
+            node = ("or", node, right)
+        return node
+
+    def _parse_and(self):
+        node = self._parse_primary()
+        while self._peek() == "&":
+            self._consume("&")
+            right = self._parse_primary()
+            node = ("and", node, right)
+        return node
+
+    def _parse_primary(self):
+        token = self._peek()
+        if token == "(":
+            self._consume("(")
+            node = self._parse_or()
+            self._consume(")")
+            return node
+        if token in ("", ")", "&", "|"):
+            raise ValueError(
+                f"Invalid token '{token or '<end>'}' in TITLE_FILTER_EXPRESSION"
+            )
+        term = self._consume()
+        return ("term", term)
+
+
+def _evaluate_filter_ast(node, title_lower: str, title_compact: str) -> bool:
+    node_type = node[0]
+    if node_type == "term":
+        return _term_matches_title(node[1], title_lower, title_compact)
+    if node_type == "and":
+        return _evaluate_filter_ast(node[1], title_lower, title_compact) and _evaluate_filter_ast(
+            node[2], title_lower, title_compact
+        )
+    if node_type == "or":
+        return _evaluate_filter_ast(node[1], title_lower, title_compact) or _evaluate_filter_ast(
+            node[2], title_lower, title_compact
+        )
+    raise ValueError(f"Unknown expression node type: {node_type}")
+
+
+@lru_cache(maxsize=1)
+def _get_title_filter_ast():
+    if not TITLE_FILTER_EXPRESSION:
+        return None
+    tokens = _tokenize_filter_expression(TITLE_FILTER_EXPRESSION)
+    if not tokens:
+        raise ValueError("TITLE_FILTER_EXPRESSION is set but empty after tokenization.")
+    parser = _ExprParser(tokens)
+    return parser.parse()
+
+
 def _title_matches_term_filters(title: str) -> bool:
     title_lower = title.lower()
     title_compact = _normalized_text_for_term_matching(title)
+    expression_ast = _get_title_filter_ast()
+    if expression_ast is not None:
+        return _evaluate_filter_ast(expression_ast, title_lower, title_compact)
 
-    def term_matches(term: str) -> bool:
-        term_lower = term.lower()
-        if not term_lower:
-            return False
-        if term_lower in title_lower:
-            return True
-        return _normalized_text_for_term_matching(term_lower) in title_compact
-
-    all_ok = all(term_matches(term) for term in REQUIRED_ALL_TERMS) if REQUIRED_ALL_TERMS else True
-    any_ok = any(term_matches(term) for term in REQUIRED_ANY_TERMS) if REQUIRED_ANY_TERMS else True
+    all_ok = (
+        all(_term_matches_title(term, title_lower, title_compact) for term in REQUIRED_ALL_TERMS)
+        if REQUIRED_ALL_TERMS
+        else True
+    )
+    any_ok = (
+        any(_term_matches_title(term, title_lower, title_compact) for term in REQUIRED_ANY_TERMS)
+        if REQUIRED_ANY_TERMS
+        else True
+    )
     return all_ok and any_ok
 
 
@@ -601,6 +733,9 @@ def main() -> None:
             "PAGE_DELAY_RANGE_SECONDS": list(PAGE_DELAY_RANGE_SECONDS),
             "KEYWORD_DELAY_RANGE_SECONDS": list(KEYWORD_DELAY_RANGE_SECONDS),
             "HEARTBEAT_INTERVAL_SECONDS": HEARTBEAT_INTERVAL_SECONDS,
+            "TITLE_FILTER_EXPRESSION": TITLE_FILTER_EXPRESSION,
+            "REQUIRED_ALL_TERMS": REQUIRED_ALL_TERMS,
+            "REQUIRED_ANY_TERMS": REQUIRED_ANY_TERMS,
         },
         "totals": {
             "rows_collected_before_dedupe": 0,
@@ -619,6 +754,10 @@ def main() -> None:
     }
 
     log("Scraper started.")
+    if TITLE_FILTER_EXPRESSION:
+        # Fail fast if expression is malformed instead of silently running with bad filtering.
+        _get_title_filter_ast()
+        log(f"Title filter expression: {TITLE_FILTER_EXPRESSION}")
     log(
         f"Keyword source: {'KEYWORDS env var' if KEYWORDS_ENV else 'DEFAULT_KEYWORDS list'}. "
         f"Total keywords: {len(KEYWORDS)}"
@@ -630,6 +769,7 @@ def main() -> None:
         f"PAGE_DELAY_RANGE_SECONDS={PAGE_DELAY_RANGE_SECONDS[0]}-{PAGE_DELAY_RANGE_SECONDS[1]}, "
         f"KEYWORD_DELAY_RANGE_SECONDS={KEYWORD_DELAY_RANGE_SECONDS[0]}-{KEYWORD_DELAY_RANGE_SECONDS[1]}, "
         f"HEARTBEAT_INTERVAL_SECONDS={HEARTBEAT_INTERVAL_SECONDS}, "
+        f"TITLE_FILTER_EXPRESSION={TITLE_FILTER_EXPRESSION or '<not set>'}, "
         f"REQUIRED_ALL_TERMS={REQUIRED_ALL_TERMS}, "
         f"REQUIRED_ANY_TERMS={REQUIRED_ANY_TERMS}"
     )

@@ -74,11 +74,25 @@ def _parse_range_env(name: str, default: Tuple[float, float]) -> Tuple[float, fl
     return default
 
 
+def _parse_terms_env(name: str, default: List[str]) -> List[str]:
+    raw_value = os.getenv(name, "").strip()
+    if not raw_value:
+        return default
+
+    normalized = raw_value.replace(";", "|").replace(",", "|")
+    terms = [item.strip().lower() for item in normalized.split("|") if item.strip()]
+    if not terms:
+        return default
+    return terms
+
+
 MAX_PAGES_PER_KEYWORD = _parse_positive_int_env("MAX_PAGES_PER_KEYWORD", 3)
 MAX_POST_AGE_DAYS = _parse_positive_int_env("MAX_POST_AGE_DAYS", 14)
 PAGE_DELAY_RANGE_SECONDS = _parse_range_env("PAGE_DELAY_RANGE_SECONDS", (2.0, 4.0))
 KEYWORD_DELAY_RANGE_SECONDS = _parse_range_env("KEYWORD_DELAY_RANGE_SECONDS", (3.0, 6.0))
 HEARTBEAT_INTERVAL_SECONDS = _parse_positive_int_env("HEARTBEAT_INTERVAL_SECONDS", 5)
+REQUIRED_ALL_TERMS = _parse_terms_env("REQUIRED_ALL_TERMS", ["robot"])
+REQUIRED_ANY_TERMS = _parse_terms_env("REQUIRED_ANY_TERMS", ["intern", "co-op", "junior"])
 USER_AGENT = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
     "AppleWebKit/537.36 (KHTML, like Gecko) "
@@ -181,6 +195,27 @@ def _build_search_url(keyword: str, start: int) -> str:
 
 def _normalize_job_url(url: str) -> str:
     return url.split("?", 1)[0].rstrip("/")
+
+
+def _normalized_text_for_term_matching(value: str) -> str:
+    return re.sub(r"[^a-z0-9]+", "", value.lower())
+
+
+def _title_matches_term_filters(title: str) -> bool:
+    title_lower = title.lower()
+    title_compact = _normalized_text_for_term_matching(title)
+
+    def term_matches(term: str) -> bool:
+        term_lower = term.lower()
+        if not term_lower:
+            return False
+        if term_lower in title_lower:
+            return True
+        return _normalized_text_for_term_matching(term_lower) in title_compact
+
+    all_ok = all(term_matches(term) for term in REQUIRED_ALL_TERMS) if REQUIRED_ALL_TERMS else True
+    any_ok = any(term_matches(term) for term in REQUIRED_ANY_TERMS) if REQUIRED_ANY_TERMS else True
+    return all_ok and any_ok
 
 
 def _normalize_apply_url(apply_href: str, job_url: str) -> str:
@@ -324,6 +359,7 @@ def scrape_keyword_jobs(page, keyword: str, now_utc: datetime) -> tuple[List[Dic
     skipped_old = 0
     kept_unknown_date = 0
     skipped_missing_url = 0
+    skipped_term_filter = 0
     no_results_pages = 0
     page_timeouts = 0
     pages_scanned = 0
@@ -410,6 +446,9 @@ def scrape_keyword_jobs(page, keyword: str, now_utc: datetime) -> tuple[List[Dic
 
             card = cards.nth(i)
             title = _safe_text(card, ["h3.base-search-card__title", "h3"])
+            if not _title_matches_term_filters(title):
+                skipped_term_filter += 1
+                continue
             company = _safe_text(
                 card,
                 ["h4.base-search-card__subtitle", ".base-search-card__subtitle", "h4"],
@@ -453,7 +492,7 @@ def scrape_keyword_jobs(page, keyword: str, now_utc: datetime) -> tuple[List[Dic
     log(
         f"Collected {len(jobs)} recent rows for '{keyword}'. "
         f"Skipped old: {skipped_old}, kept unknown-date: {kept_unknown_date}, "
-        f"missing URL: {skipped_missing_url}"
+        f"missing URL: {skipped_missing_url}, title-term-filter: {skipped_term_filter}"
     )
     return jobs, {
         "keyword": keyword,
@@ -464,6 +503,7 @@ def scrape_keyword_jobs(page, keyword: str, now_utc: datetime) -> tuple[List[Dic
         "skipped_old": skipped_old,
         "kept_unknown_date": kept_unknown_date,
         "missing_url": skipped_missing_url,
+        "skipped_term_filter": skipped_term_filter,
     }
 
 
@@ -569,6 +609,7 @@ def main() -> None:
             "skipped_old": 0,
             "kept_unknown_date": 0,
             "missing_url": 0,
+            "skipped_term_filter": 0,
             "page_timeouts": 0,
             "no_results_pages": 0,
         },
@@ -588,7 +629,9 @@ def main() -> None:
         f"MAX_PAGES_PER_KEYWORD={MAX_PAGES_PER_KEYWORD}, "
         f"PAGE_DELAY_RANGE_SECONDS={PAGE_DELAY_RANGE_SECONDS[0]}-{PAGE_DELAY_RANGE_SECONDS[1]}, "
         f"KEYWORD_DELAY_RANGE_SECONDS={KEYWORD_DELAY_RANGE_SECONDS[0]}-{KEYWORD_DELAY_RANGE_SECONDS[1]}, "
-        f"HEARTBEAT_INTERVAL_SECONDS={HEARTBEAT_INTERVAL_SECONDS}"
+        f"HEARTBEAT_INTERVAL_SECONDS={HEARTBEAT_INTERVAL_SECONDS}, "
+        f"REQUIRED_ALL_TERMS={REQUIRED_ALL_TERMS}, "
+        f"REQUIRED_ANY_TERMS={REQUIRED_ANY_TERMS}"
     )
     try:
         client = get_gspread_client()
@@ -682,6 +725,7 @@ def main() -> None:
             "skipped_old": sum(int(item["skipped_old"]) for item in summary["keywords"]),
             "kept_unknown_date": sum(int(item["kept_unknown_date"]) for item in summary["keywords"]),
             "missing_url": sum(int(item["missing_url"]) for item in summary["keywords"]),
+            "skipped_term_filter": sum(int(item["skipped_term_filter"]) for item in summary["keywords"]),
             "page_timeouts": sum(int(item["page_timeouts"]) for item in summary["keywords"]),
             "no_results_pages": sum(int(item["no_results_pages"]) for item in summary["keywords"]),
         }

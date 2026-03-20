@@ -690,6 +690,31 @@ def get_existing_job_urls(worksheet) -> set[str]:
     return existing_urls
 
 
+def get_next_empty_row(worksheet) -> int:
+    # Column A always contains Job URL for populated rows.
+    # Using col_values keeps writes contiguous within the existing table block.
+    column_a_values = worksheet.col_values(1)
+    return max(len(column_a_values) + 1, 2)
+
+
+def write_rows_to_next_empty_range(worksheet, rows: List[List[str]]) -> None:
+    if not rows:
+        return
+
+    start_row = get_next_empty_row(worksheet)
+    end_row = start_row + len(rows) - 1
+    if end_row > worksheet.row_count:
+        worksheet.add_rows(end_row - worksheet.row_count)
+        log(
+            f"Expanded worksheet by {end_row - worksheet.row_count} rows "
+            f"to fit write range ending at row {end_row}."
+        )
+
+    range_name = f"A{start_row}:I{end_row}"
+    worksheet.update(range_name=range_name, values=rows, value_input_option="RAW")
+    log(f"Wrote {len(rows)} rows to range {range_name} in tab '{worksheet.title}'.")
+
+
 def main() -> None:
     started_at = datetime.utcnow()
     summary: Dict[str, Any] = {
@@ -801,7 +826,7 @@ def main() -> None:
                         f"Appending {len(keyword_rows_to_append)} rows to tab '{worksheet.title}' "
                         f"for keyword '{keyword}'."
                     )
-                    worksheet.append_rows(keyword_rows_to_append, value_input_option="RAW")
+                    write_rows_to_next_empty_range(worksheet, keyword_rows_to_append)
                     log(f"Appended {len(keyword_rows_to_append)} rows to tab '{worksheet.title}'.")
                 else:
                     log(f"No new rows to append for keyword '{keyword}'.")

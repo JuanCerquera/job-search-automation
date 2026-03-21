@@ -12,7 +12,6 @@ jobs:
       SHEET_ID: ${{ vars.SHEET_ID }}
       CREDS_FILE: service_account.json
       KEYWORDS: ${{ vars.KEYWORDS }}
-      JOB_SOURCES: ${{ vars.JOB_SOURCES }}
       USAJOBS_API_KEY: ${{ vars.USAJOBS_API_KEY }}
       USAJOBS_USER_AGENT_EMAIL: ${{ vars.USAJOBS_USER_AGENT_EMAIL }}
       USAJOBS_RESULTS_PER_PAGE: ${{ vars.USAJOBS_RESULTS_PER_PAGE }}

@@ -107,14 +107,7 @@ DEFAULT_KEYWORDS = [
 # "Keyword A|Keyword B|Keyword C"
 KEYWORDS_ENV = os.getenv("KEYWORDS", "").strip()
 KEYWORDS = [k.strip() for k in KEYWORDS_ENV.split("|") if k.strip()] if KEYWORDS_ENV else DEFAULT_KEYWORDS
-JOB_SOURCES_ENV = os.getenv("JOB_SOURCES", "linkedin").strip()
-JOB_SOURCES = [
-    source.strip().lower()
-    for source in JOB_SOURCES_ENV.replace(";", "|").replace(",", "|").split("|")
-    if source.strip()
-]
-if not JOB_SOURCES:
-    JOB_SOURCES = ["linkedin"]
+SUPPORTED_SOURCES = ["linkedin", "usajobs", "adzuna", "jooble"]
 
 USAJOBS_API_KEY = os.getenv("USAJOBS_API_KEY", "").strip()
 USAJOBS_USER_AGENT_EMAIL = os.getenv("USAJOBS_USER_AGENT_EMAIL", "").strip()
@@ -1187,13 +1180,23 @@ def write_rows_to_next_empty_range(worksheet, rows: List[List[str]]) -> None:
 
 def main() -> None:
     started_at = datetime.utcnow()
-    source_batch_multipliers = {
-        "linkedin": len(KEYWORDS),
-        "usajobs": len(KEYWORDS),
-        "adzuna": len(KEYWORDS),
-        "jooble": len(KEYWORDS),
-    }
-    total_batches = sum(source_batch_multipliers.get(source, 0) for source in JOB_SOURCES)
+
+    enabled_sources = ["linkedin"]
+    disabled_sources: Dict[str, str] = {}
+    if USAJOBS_API_KEY and USAJOBS_USER_AGENT_EMAIL:
+        enabled_sources.append("usajobs")
+    else:
+        disabled_sources["usajobs"] = "missing USAJOBS_API_KEY or USAJOBS_USER_AGENT_EMAIL"
+    if ADZUNA_APP_ID and ADZUNA_APP_KEY:
+        enabled_sources.append("adzuna")
+    else:
+        disabled_sources["adzuna"] = "missing ADZUNA_APP_ID or ADZUNA_APP_KEY"
+    if JOOBLE_API_KEY:
+        enabled_sources.append("jooble")
+    else:
+        disabled_sources["jooble"] = "missing JOOBLE_API_KEY"
+
+    total_batches = len(KEYWORDS) * len(enabled_sources)
     summary: Dict[str, Any] = {
         "phase": "phase3_multi_source",
         "status": "running",
@@ -1212,7 +1215,9 @@ def main() -> None:
             "KEYWORD_DELAY_RANGE_SECONDS": list(KEYWORD_DELAY_RANGE_SECONDS),
             "HEARTBEAT_INTERVAL_SECONDS": HEARTBEAT_INTERVAL_SECONDS,
             "TITLE_FILTER_EXPRESSION": TITLE_FILTER_EXPRESSION,
-            "JOB_SOURCES": JOB_SOURCES,
+            "SUPPORTED_SOURCES": SUPPORTED_SOURCES,
+            "ENABLED_SOURCES": enabled_sources,
+            "DISABLED_SOURCES": disabled_sources,
             "USAJOBS_MAX_PAGES": USAJOBS_MAX_PAGES,
             "ADZUNA_MAX_PAGES": ADZUNA_MAX_PAGES,
             "JOOBLE_MAX_PAGES": JOOBLE_MAX_PAGES,
@@ -1248,7 +1253,9 @@ def main() -> None:
         f"Keyword source: {'KEYWORDS env var' if KEYWORDS_ENV else 'DEFAULT_KEYWORDS list'}. "
         f"Total keywords: {len(KEYWORDS)}"
     )
-    log(f"Enabled job sources: {JOB_SOURCES}")
+    log(f"Enabled job sources: {enabled_sources}")
+    if disabled_sources:
+        log(f"Skipped sources due missing config: {disabled_sources}")
     log(f"Date filter: jobs posted within the last {MAX_POST_AGE_DAYS} days.")
     log(
         "Runtime config: "
@@ -1420,11 +1427,7 @@ def main() -> None:
                     f"Canonical dupes vs existing: {batch_canonical_dupes_against_existing}"
                 )
 
-            for source_index, source_name in enumerate(JOB_SOURCES):
-                if source_name not in {"linkedin", "usajobs", "adzuna", "jooble"}:
-                    log(f"Skipping unsupported source '{source_name}'.")
-                    continue
-
+            for source_index, source_name in enumerate(enabled_sources):
                 for keyword_index, keyword in enumerate(KEYWORDS):
                     log(
                         f"Starting source '{source_name}' keyword "
@@ -1443,7 +1446,7 @@ def main() -> None:
                     process_jobs_batch(f"{source_name}:{keyword}", source_jobs, source_stats)
 
                     is_last_keyword = keyword_index == len(KEYWORDS) - 1
-                    is_last_source = source_index == len(JOB_SOURCES) - 1
+                    is_last_source = source_index == len(enabled_sources) - 1
                     if not (is_last_keyword and is_last_source):
                         _sleep_random(KEYWORD_DELAY_RANGE_SECONDS, "between source batches")
 

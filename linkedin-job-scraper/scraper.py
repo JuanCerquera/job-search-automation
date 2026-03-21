@@ -11,7 +11,7 @@ from datetime import date, datetime, timedelta, timezone
 from functools import lru_cache
 from pathlib import Path
 from typing import Dict, List, Tuple, Any
-from urllib.parse import parse_qs, quote, quote_plus, urljoin, urlparse
+from urllib.parse import parse_qs, quote, quote_plus, unquote, urljoin, urlparse
 
 import gspread
 from google.auth.transport.requests import Request
@@ -123,6 +123,18 @@ ADZUNA_MAX_PAGES = _parse_positive_int_env("ADZUNA_MAX_PAGES", 2)
 JOOBLE_API_KEY = os.getenv("JOOBLE_API_KEY", "").strip()
 JOOBLE_LOCATION = os.getenv("JOOBLE_LOCATION", "").strip()
 JOOBLE_MAX_PAGES = _parse_positive_int_env("JOOBLE_MAX_PAGES", 2)
+JOOBLE_BLOCKED_DOMAINS = [
+    item.strip().lower()
+    for item in os.getenv("JOOBLE_BLOCKED_DOMAINS", "jobleads.com,jobleads").replace(";", ",").split(",")
+    if item.strip()
+]
+JOOBLE_FILTER_REDIRECTS = os.getenv("JOOBLE_FILTER_REDIRECTS", "true").strip().lower() in {
+    "1",
+    "true",
+    "yes",
+    "on",
+}
+JOOBLE_REDIRECT_TIMEOUT_SECONDS = _parse_positive_int_env("JOOBLE_REDIRECT_TIMEOUT_SECONDS", 8)
 
 SCRAPE_LOCATION = os.getenv("SCRAPE_LOCATION", "United States").strip() or "United States"
 INDEED_ENABLED = os.getenv("INDEED_ENABLED", "true").strip().lower() in {"1", "true", "yes", "on"}
@@ -263,6 +275,79 @@ def _join_sources(existing_seen_on: str, new_source: str) -> str:
     if new_source and new_source.lower() not in existing_set:
         existing_parts.append(new_source)
     return ", ".join(existing_parts)
+
+
+def _normalized_domain_from_url(url: str) -> str:
+    try:
+        domain = (urlparse(url).netloc or "").lower().strip()
+    except Exception:
+        return ""
+    if domain.startswith("www."):
+        domain = domain[4:]
+    return domain
+
+
+def _domain_is_blocked(domain: str, blocked_domains: List[str]) -> bool:
+    if not domain:
+        return False
+    for blocked in blocked_domains:
+        candidate = blocked.lower().strip()
+        if not candidate:
+            continue
+        if domain == candidate or domain.endswith(f".{candidate}"):
+            return True
+    return False
+
+
+def _extract_redirect_urls(raw_url: str) -> List[str]:
+    values: List[str] = []
+    try:
+        parsed = urlparse(raw_url)
+        query = parse_qs(parsed.query)
+    except Exception:
+        return values
+
+    for key in ("url", "target", "redirect", "redirectUrl", "destination", "dest", "to", "u", "r"):
+        for item in query.get(key, []):
+            decoded = unquote(str(item or "").strip())
+            if decoded.startswith("http://") or decoded.startswith("https://"):
+                values.append(decoded)
+    return values
+
+
+@lru_cache(maxsize=1000)
+def _resolve_final_redirect_url(raw_url: str) -> str:
+    headers = {"User-Agent": USER_AGENT}
+    try:
+        request = urllib.request.Request(raw_url, headers=headers, method="HEAD")
+        with urllib.request.urlopen(request, timeout=JOOBLE_REDIRECT_TIMEOUT_SECONDS) as response:
+            return response.geturl()
+    except Exception:
+        try:
+            request = urllib.request.Request(raw_url, headers=headers, method="GET")
+            with urllib.request.urlopen(request, timeout=JOOBLE_REDIRECT_TIMEOUT_SECONDS) as response:
+                return response.geturl()
+        except Exception:
+            return raw_url
+
+
+def _filter_jooble_job_url(raw_url: str) -> tuple[bool, str]:
+    if not raw_url:
+        return True, ""
+
+    candidates = [raw_url, *_extract_redirect_urls(raw_url)]
+    for candidate in candidates:
+        if _domain_is_blocked(_normalized_domain_from_url(candidate), JOOBLE_BLOCKED_DOMAINS):
+            return True, raw_url
+
+    resolved = raw_url
+    raw_domain = _normalized_domain_from_url(raw_url)
+    if JOOBLE_FILTER_REDIRECTS and ("jooble." in raw_domain or "/rd/" in raw_url):
+        resolved = _resolve_final_redirect_url(raw_url)
+        if _domain_is_blocked(_normalized_domain_from_url(resolved), JOOBLE_BLOCKED_DOMAINS):
+            return True, resolved
+
+    return False, resolved
 
 
 def _normalized_text_for_term_matching(value: str) -> str:
@@ -1268,6 +1353,7 @@ def scrape_jooble_keyword_jobs(keyword: str, now_utc: datetime) -> tuple[List[Di
     skipped_old = 0
     kept_unknown_date = 0
     skipped_missing_url = 0
+    skipped_blocked_redirects = 0
     skipped_term_filter = 0
     page_timeouts = 0
     pages_scanned = 0
@@ -1285,6 +1371,7 @@ def scrape_jooble_keyword_jobs(keyword: str, now_utc: datetime) -> tuple[List[Di
             "skipped_old": 0,
             "kept_unknown_date": 0,
             "missing_url": 0,
+            "skipped_blocked_redirects": 0,
             "skipped_term_filter": 0,
         }
 
@@ -1333,6 +1420,11 @@ def scrape_jooble_keyword_jobs(keyword: str, now_utc: datetime) -> tuple[List[Di
             if not job_url:
                 skipped_missing_url += 1
                 continue
+            is_blocked, resolved_url = _filter_jooble_job_url(job_url)
+            if is_blocked:
+                skipped_blocked_redirects += 1
+                continue
+            job_url = resolved_url or job_url
             normalized_job_url = _normalize_job_url(job_url)
             if normalized_job_url in seen_urls:
                 continue
@@ -1352,6 +1444,11 @@ def scrape_jooble_keyword_jobs(keyword: str, now_utc: datetime) -> tuple[List[Di
                 }
             )
 
+    log(
+        f"Collected {len(jobs)} Jooble rows for '{keyword}'. "
+        f"Skipped blocked redirects: {skipped_blocked_redirects}, "
+        f"old: {skipped_old}, missing URL: {skipped_missing_url}, title-term-filter: {skipped_term_filter}"
+    )
     return jobs, {
         "keyword": keyword,
         "source": "jooble",
@@ -1362,6 +1459,7 @@ def scrape_jooble_keyword_jobs(keyword: str, now_utc: datetime) -> tuple[List[Di
         "skipped_old": skipped_old,
         "kept_unknown_date": kept_unknown_date,
         "missing_url": skipped_missing_url,
+        "skipped_blocked_redirects": skipped_blocked_redirects,
         "skipped_term_filter": skipped_term_filter,
     }
 

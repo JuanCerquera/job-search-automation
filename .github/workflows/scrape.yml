@@ -12,6 +12,30 @@ jobs:
       SHEET_ID: ${{ vars.SHEET_ID }}
       CREDS_FILE: service_account.json
       KEYWORDS: ${{ vars.KEYWORDS }}
+      SCRAPE_LOCATION: ${{ vars.SCRAPE_LOCATION }}
+      INDEED_ENABLED: ${{ vars.INDEED_ENABLED }}
+      INDEED_MAX_PAGES: ${{ vars.INDEED_MAX_PAGES }}
+      ZIPRECRUITER_ENABLED: ${{ vars.ZIPRECRUITER_ENABLED }}
+      ZIPRECRUITER_MAX_PAGES: ${{ vars.ZIPRECRUITER_MAX_PAGES }}
+      USAJOBS_API_KEY: ${{ vars.USAJOBS_API_KEY }}
+      USAJOBS_USER_AGENT_EMAIL: ${{ vars.USAJOBS_USER_AGENT_EMAIL }}
+      USAJOBS_RESULTS_PER_PAGE: ${{ vars.USAJOBS_RESULTS_PER_PAGE }}
+      USAJOBS_MAX_PAGES: ${{ vars.USAJOBS_MAX_PAGES }}
+      ADZUNA_APP_ID: ${{ vars.ADZUNA_APP_ID }}
+      ADZUNA_APP_KEY: ${{ vars.ADZUNA_APP_KEY }}
+      ADZUNA_COUNTRY: ${{ vars.ADZUNA_COUNTRY }}
+      ADZUNA_RESULTS_PER_PAGE: ${{ vars.ADZUNA_RESULTS_PER_PAGE }}
+      ADZUNA_MAX_PAGES: ${{ vars.ADZUNA_MAX_PAGES }}
+      JOOBLE_API_KEY: ${{ vars.JOOBLE_API_KEY }}
+      JOOBLE_LOCATION: ${{ vars.JOOBLE_LOCATION }}
+      JOOBLE_MAX_PAGES: ${{ vars.JOOBLE_MAX_PAGES }}
+      GREENHOUSE_DISCOVERY_ENABLED: ${{ vars.GREENHOUSE_DISCOVERY_ENABLED }}
+      GREENHOUSE_DISCOVERY_MAX_URLS: ${{ vars.GREENHOUSE_DISCOVERY_MAX_URLS }}
+      GREENHOUSE_DISCOVERY_HTTP_TIMEOUT: ${{ vars.GREENHOUSE_DISCOVERY_HTTP_TIMEOUT }}
+      GREENHOUSE_DISCOVERY_MAX_FETCH_BYTES: ${{ vars.GREENHOUSE_DISCOVERY_MAX_FETCH_BYTES }}
+      GREENHOUSE_DISCOVERY_VALIDATE: ${{ vars.GREENHOUSE_DISCOVERY_VALIDATE }}
+      GREENHOUSE_TOKENS_WORKSHEET: ${{ vars.GREENHOUSE_TOKENS_WORKSHEET }}
+      GREENHOUSE_DISCOVERY_SUMMARY_FILE: greenhouse_discovery_summary.json
       MAX_PAGES_PER_KEYWORD: ${{ vars.MAX_PAGES_PER_KEYWORD }}
       MAX_POST_AGE_DAYS: ${{ vars.MAX_POST_AGE_DAYS }}
       PAGE_DELAY_RANGE_SECONDS: ${{ vars.PAGE_DELAY_RANGE_SECONDS }}
@@ -55,6 +79,11 @@ jobs:
 
       - name: Run scraper
         run: python -u scraper.py
+
+      - name: Discover Greenhouse tokens from collected job URLs
+        if: always()
+        continue-on-error: true
+        run: python -u discover_greenhouse_tokens.py
 
       - name: Send run email notification
         if: always()

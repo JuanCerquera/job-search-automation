@@ -11,7 +11,7 @@ from datetime import date, datetime, timedelta, timezone
 from functools import lru_cache
 from pathlib import Path
 from typing import Dict, List, Tuple, Any
-from urllib.parse import quote, quote_plus
+from urllib.parse import parse_qs, quote, quote_plus, urljoin, urlparse
 
 import gspread
 from google.auth.transport.requests import Request
@@ -107,7 +107,7 @@ DEFAULT_KEYWORDS = [
 # "Keyword A|Keyword B|Keyword C"
 KEYWORDS_ENV = os.getenv("KEYWORDS", "").strip()
 KEYWORDS = [k.strip() for k in KEYWORDS_ENV.split("|") if k.strip()] if KEYWORDS_ENV else DEFAULT_KEYWORDS
-SUPPORTED_SOURCES = ["linkedin", "usajobs", "adzuna", "jooble"]
+SUPPORTED_SOURCES = ["linkedin", "indeed", "ziprecruiter", "usajobs", "adzuna", "jooble"]
 
 USAJOBS_API_KEY = os.getenv("USAJOBS_API_KEY", "").strip()
 USAJOBS_USER_AGENT_EMAIL = os.getenv("USAJOBS_USER_AGENT_EMAIL", "").strip()
@@ -123,6 +123,17 @@ ADZUNA_MAX_PAGES = _parse_positive_int_env("ADZUNA_MAX_PAGES", 2)
 JOOBLE_API_KEY = os.getenv("JOOBLE_API_KEY", "").strip()
 JOOBLE_LOCATION = os.getenv("JOOBLE_LOCATION", "").strip()
 JOOBLE_MAX_PAGES = _parse_positive_int_env("JOOBLE_MAX_PAGES", 2)
+
+SCRAPE_LOCATION = os.getenv("SCRAPE_LOCATION", "United States").strip() or "United States"
+INDEED_ENABLED = os.getenv("INDEED_ENABLED", "true").strip().lower() in {"1", "true", "yes", "on"}
+INDEED_MAX_PAGES = _parse_positive_int_env("INDEED_MAX_PAGES", 1)
+ZIPRECRUITER_ENABLED = os.getenv("ZIPRECRUITER_ENABLED", "true").strip().lower() in {
+    "1",
+    "true",
+    "yes",
+    "on",
+}
+ZIPRECRUITER_MAX_PAGES = _parse_positive_int_env("ZIPRECRUITER_MAX_PAGES", 1)
 
 HEADERS = [
     "Job URL",
@@ -632,6 +643,397 @@ def scrape_keyword_jobs(page, keyword: str, now_utc: datetime) -> tuple[List[Dic
     return jobs, {
         "keyword": keyword,
         "source": SOURCE_NAME,
+        "pages_scanned": pages_scanned,
+        "page_timeouts": page_timeouts,
+        "no_results_pages": no_results_pages,
+        "rows_collected": len(jobs),
+        "skipped_old": skipped_old,
+        "kept_unknown_date": kept_unknown_date,
+        "missing_url": skipped_missing_url,
+        "skipped_term_filter": skipped_term_filter,
+    }
+
+
+def _page_is_likely_bot_blocked(page) -> bool:
+    try:
+        body_text = page.locator("body").inner_text(timeout=2000).lower()
+    except Exception:
+        return False
+    markers = [
+        "captcha",
+        "verify you are human",
+        "security check",
+        "access denied",
+        "unusual traffic",
+    ]
+    return any(marker in body_text for marker in markers)
+
+
+def _jsonld_collect_job_postings(node, collected: List[Dict[str, Any]]) -> None:
+    if isinstance(node, list):
+        for item in node:
+            _jsonld_collect_job_postings(item, collected)
+        return
+
+    if not isinstance(node, dict):
+        return
+
+    raw_type = node.get("@type")
+    type_values = []
+    if isinstance(raw_type, str):
+        type_values = [raw_type]
+    elif isinstance(raw_type, list):
+        type_values = [str(value) for value in raw_type]
+
+    if any(value.lower() == "jobposting" for value in type_values):
+        collected.append(node)
+
+    for value in node.values():
+        if isinstance(value, (dict, list)):
+            _jsonld_collect_job_postings(value, collected)
+
+
+def _extract_location_from_jobposting(job_posting: Dict[str, Any]) -> str:
+    raw_location = job_posting.get("jobLocation")
+    if isinstance(raw_location, list) and raw_location:
+        raw_location = raw_location[0]
+
+    if isinstance(raw_location, dict):
+        address = raw_location.get("address", raw_location)
+        if isinstance(address, dict):
+            parts = [
+                str(address.get("addressLocality") or "").strip(),
+                str(address.get("addressRegion") or "").strip(),
+                str(address.get("addressCountry") or "").strip(),
+            ]
+            return ", ".join(part for part in parts if part)
+        if isinstance(address, str):
+            return address.strip()
+
+    if isinstance(raw_location, str):
+        return raw_location.strip()
+    return ""
+
+
+def _extract_source_job_id_from_jsonld(job_posting: Dict[str, Any]) -> str:
+    identifier = job_posting.get("identifier")
+    if isinstance(identifier, dict):
+        return str(identifier.get("value") or identifier.get("@value") or "").strip()
+    if isinstance(identifier, list) and identifier:
+        first = identifier[0]
+        if isinstance(first, dict):
+            return str(first.get("value") or first.get("@value") or "").strip()
+        return str(first).strip()
+    if identifier:
+        return str(identifier).strip()
+    return ""
+
+
+def _extract_job_postings_from_jsonld(page, base_url: str, source: str, keyword: str) -> List[Dict[str, str]]:
+    jobs: List[Dict[str, str]] = []
+    seen_urls = set()
+    scripts = page.locator("script[type='application/ld+json']")
+    script_count = min(scripts.count(), 40)
+    all_job_postings: List[Dict[str, Any]] = []
+
+    for index in range(script_count):
+        script = scripts.nth(index)
+        try:
+            raw_text = script.inner_text(timeout=800).strip()
+            if not raw_text:
+                continue
+            json_payload = json.loads(raw_text)
+            _jsonld_collect_job_postings(json_payload, all_job_postings)
+        except Exception:
+            continue
+
+    for job_posting in all_job_postings:
+        title = str(job_posting.get("title") or "").strip()
+        job_url_raw = str(job_posting.get("url") or "").strip()
+        if not title or not job_url_raw:
+            continue
+        job_url = _normalize_job_url(urljoin(base_url, job_url_raw))
+        if job_url in seen_urls:
+            continue
+        seen_urls.add(job_url)
+
+        hiring_org = job_posting.get("hiringOrganization")
+        if isinstance(hiring_org, dict):
+            company = str(hiring_org.get("name") or "").strip()
+        else:
+            company = str(hiring_org or "").strip()
+
+        source_job_id = _extract_source_job_id_from_jsonld(job_posting)
+        jobs.append(
+            {
+                "title": title,
+                "company": company,
+                "location": _extract_location_from_jobposting(job_posting),
+                "date_posted": str(job_posting.get("datePosted") or "").strip(),
+                "job_url": job_url,
+                "keyword": keyword,
+                "source": source,
+                "source_job_id": source_job_id,
+                "canonical_key": _build_canonical_key(title, company, _extract_location_from_jobposting(job_posting)),
+            }
+        )
+    return jobs
+
+
+def scrape_indeed_keyword_jobs(page, keyword: str, now_utc: datetime) -> tuple[List[Dict[str, str]], Dict[str, Any]]:
+    jobs: List[Dict[str, str]] = []
+    seen_urls = set()
+    skipped_old = 0
+    kept_unknown_date = 0
+    skipped_missing_url = 0
+    skipped_term_filter = 0
+    page_timeouts = 0
+    pages_scanned = 0
+    no_results_pages = 0
+
+    for page_index in range(INDEED_MAX_PAGES):
+        if page_index > 0:
+            _sleep_random(PAGE_DELAY_RANGE_SECONDS, "between indeed pages")
+
+        start = page_index * 10
+        url = (
+            f"https://www.indeed.com/jobs?q={quote_plus(keyword)}&l={quote_plus(SCRAPE_LOCATION)}"
+            f"&sort=date&fromage={MAX_POST_AGE_DAYS}&start={start}"
+        )
+        log(f"Loading Indeed page {page_index + 1}/{INDEED_MAX_PAGES}: {url}")
+        try:
+            run_with_heartbeat(
+                action=f"loading indeed page {page_index + 1} for '{keyword}'",
+                func=page.goto,
+                url=url,
+                wait_until="domcontentloaded",
+                timeout=60000,
+            )
+        except PlaywrightTimeoutError:
+            page_timeouts += 1
+            continue
+
+        if _page_is_likely_bot_blocked(page):
+            log(f"Indeed appears blocked for keyword '{keyword}'")
+            page_timeouts += 1
+            break
+
+        pages_scanned += 1
+        page_jobs = _extract_job_postings_from_jsonld(page, "https://www.indeed.com", "indeed", keyword)
+
+        if not page_jobs:
+            cards = page.locator("div.job_seen_beacon, div[data-jk]")
+            card_count = min(cards.count(), 120)
+            if card_count == 0:
+                no_results_pages += 1
+                break
+
+            for i in range(card_count):
+                card = cards.nth(i)
+                title = _safe_text(card, ["h2.jobTitle span[title]", "h2.jobTitle span", "a[data-jk] span"])
+                if not title:
+                    continue
+                if not _title_matches_term_filters(title):
+                    skipped_term_filter += 1
+                    continue
+                company = _safe_text(card, ["span[data-testid='company-name']", "span.companyName"])
+                location = _safe_text(card, ["div[data-testid='text-location']", "div.companyLocation"])
+                posted_date = _safe_text(card, ["span.date", "[data-testid='myJobsStateDate']"])
+                is_recent, is_unknown_date = _is_recent_enough(posted_date, now_utc)
+                if is_unknown_date:
+                    kept_unknown_date += 1
+                if not is_recent:
+                    skipped_old += 1
+                    continue
+
+                link = card.locator("h2.jobTitle a, a[data-jk]").first
+                href = ""
+                try:
+                    href = link.get_attribute("href", timeout=1000) or ""
+                except Exception:
+                    href = ""
+                if not href:
+                    skipped_missing_url += 1
+                    continue
+                job_url = _normalize_job_url(urljoin("https://www.indeed.com", href))
+                if job_url in seen_urls:
+                    continue
+                seen_urls.add(job_url)
+
+                data_jk = ""
+                try:
+                    data_jk = (card.get_attribute("data-jk", timeout=300) or "").strip()
+                except Exception:
+                    data_jk = ""
+                if not data_jk:
+                    data_jk = (parse_qs(urlparse(job_url).query).get("jk", [""])[0] or "").strip()
+
+                jobs.append(
+                    {
+                        "title": title,
+                        "company": company,
+                        "location": location,
+                        "date_posted": posted_date,
+                        "job_url": job_url,
+                        "keyword": keyword,
+                        "source": "indeed",
+                        "source_job_id": data_jk,
+                        "canonical_key": _build_canonical_key(title, company, location),
+                    }
+                )
+        else:
+            for item in page_jobs:
+                title = item["title"]
+                if not _title_matches_term_filters(title):
+                    skipped_term_filter += 1
+                    continue
+                posted_date = item.get("date_posted", "")
+                is_recent, is_unknown_date = _is_recent_enough(posted_date, now_utc)
+                if is_unknown_date:
+                    kept_unknown_date += 1
+                if not is_recent:
+                    skipped_old += 1
+                    continue
+                job_url = item.get("job_url", "")
+                if not job_url:
+                    skipped_missing_url += 1
+                    continue
+                if job_url in seen_urls:
+                    continue
+                seen_urls.add(job_url)
+                jobs.append(item)
+
+    return jobs, {
+        "keyword": keyword,
+        "source": "indeed",
+        "pages_scanned": pages_scanned,
+        "page_timeouts": page_timeouts,
+        "no_results_pages": no_results_pages,
+        "rows_collected": len(jobs),
+        "skipped_old": skipped_old,
+        "kept_unknown_date": kept_unknown_date,
+        "missing_url": skipped_missing_url,
+        "skipped_term_filter": skipped_term_filter,
+    }
+
+
+def scrape_ziprecruiter_keyword_jobs(page, keyword: str, now_utc: datetime) -> tuple[List[Dict[str, str]], Dict[str, Any]]:
+    jobs: List[Dict[str, str]] = []
+    seen_urls = set()
+    skipped_old = 0
+    kept_unknown_date = 0
+    skipped_missing_url = 0
+    skipped_term_filter = 0
+    page_timeouts = 0
+    pages_scanned = 0
+    no_results_pages = 0
+
+    for page_number in range(1, ZIPRECRUITER_MAX_PAGES + 1):
+        if page_number > 1:
+            _sleep_random(PAGE_DELAY_RANGE_SECONDS, "between ziprecruiter pages")
+
+        url = (
+            "https://www.ziprecruiter.com/jobs-search"
+            f"?search={quote_plus(keyword)}&location={quote_plus(SCRAPE_LOCATION)}"
+            f"&days={MAX_POST_AGE_DAYS}&page={page_number}"
+        )
+        log(f"Loading ZipRecruiter page {page_number}/{ZIPRECRUITER_MAX_PAGES}: {url}")
+        try:
+            run_with_heartbeat(
+                action=f"loading ziprecruiter page {page_number} for '{keyword}'",
+                func=page.goto,
+                url=url,
+                wait_until="domcontentloaded",
+                timeout=60000,
+            )
+        except PlaywrightTimeoutError:
+            page_timeouts += 1
+            continue
+
+        if _page_is_likely_bot_blocked(page):
+            log(f"ZipRecruiter appears blocked for keyword '{keyword}'")
+            page_timeouts += 1
+            break
+
+        pages_scanned += 1
+        page_jobs = _extract_job_postings_from_jsonld(
+            page, "https://www.ziprecruiter.com", "ziprecruiter", keyword
+        )
+
+        if not page_jobs:
+            links = page.locator("a[href*='/jobs/']")
+            link_count = min(links.count(), 120)
+            if link_count == 0:
+                no_results_pages += 1
+                break
+
+            for i in range(link_count):
+                link = links.nth(i)
+                try:
+                    href = (link.get_attribute("href", timeout=800) or "").strip()
+                except Exception:
+                    href = ""
+                if not href:
+                    continue
+                job_url = _normalize_job_url(urljoin("https://www.ziprecruiter.com", href))
+                if job_url in seen_urls:
+                    continue
+                title = ""
+                try:
+                    title = (link.inner_text(timeout=800) or "").strip()
+                except Exception:
+                    title = ""
+                if not title:
+                    try:
+                        title = (link.get_attribute("title", timeout=300) or "").strip()
+                    except Exception:
+                        title = ""
+                if not title:
+                    continue
+                if not _title_matches_term_filters(title):
+                    skipped_term_filter += 1
+                    continue
+
+                seen_urls.add(job_url)
+                jobs.append(
+                    {
+                        "title": title,
+                        "company": "",
+                        "location": "",
+                        "date_posted": "",
+                        "job_url": job_url,
+                        "keyword": keyword,
+                        "source": "ziprecruiter",
+                        "source_job_id": "",
+                        "canonical_key": _build_canonical_key(title, "", ""),
+                    }
+                )
+                kept_unknown_date += 1
+        else:
+            for item in page_jobs:
+                title = item["title"]
+                if not _title_matches_term_filters(title):
+                    skipped_term_filter += 1
+                    continue
+                posted_date = item.get("date_posted", "")
+                is_recent, is_unknown_date = _is_recent_enough(posted_date, now_utc)
+                if is_unknown_date:
+                    kept_unknown_date += 1
+                if not is_recent:
+                    skipped_old += 1
+                    continue
+                job_url = item.get("job_url", "")
+                if not job_url:
+                    skipped_missing_url += 1
+                    continue
+                if job_url in seen_urls:
+                    continue
+                seen_urls.add(job_url)
+                jobs.append(item)
+
+    return jobs, {
+        "keyword": keyword,
+        "source": "ziprecruiter",
         "pages_scanned": pages_scanned,
         "page_timeouts": page_timeouts,
         "no_results_pages": no_results_pages,
@@ -1183,6 +1585,14 @@ def main() -> None:
 
     enabled_sources = ["linkedin"]
     disabled_sources: Dict[str, str] = {}
+    if INDEED_ENABLED:
+        enabled_sources.append("indeed")
+    else:
+        disabled_sources["indeed"] = "disabled by INDEED_ENABLED"
+    if ZIPRECRUITER_ENABLED:
+        enabled_sources.append("ziprecruiter")
+    else:
+        disabled_sources["ziprecruiter"] = "disabled by ZIPRECRUITER_ENABLED"
     if USAJOBS_API_KEY and USAJOBS_USER_AGENT_EMAIL:
         enabled_sources.append("usajobs")
     else:
@@ -1218,6 +1628,9 @@ def main() -> None:
             "SUPPORTED_SOURCES": SUPPORTED_SOURCES,
             "ENABLED_SOURCES": enabled_sources,
             "DISABLED_SOURCES": disabled_sources,
+            "INDEED_MAX_PAGES": INDEED_MAX_PAGES,
+            "ZIPRECRUITER_MAX_PAGES": ZIPRECRUITER_MAX_PAGES,
+            "SCRAPE_LOCATION": SCRAPE_LOCATION,
             "USAJOBS_MAX_PAGES": USAJOBS_MAX_PAGES,
             "ADZUNA_MAX_PAGES": ADZUNA_MAX_PAGES,
             "JOOBLE_MAX_PAGES": JOOBLE_MAX_PAGES,
@@ -1436,6 +1849,10 @@ def main() -> None:
 
                     if source_name == "linkedin":
                         source_jobs, source_stats = scrape_keyword_jobs(page, keyword, now_utc)
+                    elif source_name == "indeed":
+                        source_jobs, source_stats = scrape_indeed_keyword_jobs(page, keyword, now_utc)
+                    elif source_name == "ziprecruiter":
+                        source_jobs, source_stats = scrape_ziprecruiter_keyword_jobs(page, keyword, now_utc)
                     elif source_name == "usajobs":
                         source_jobs, source_stats = scrape_usajobs_keyword_jobs(keyword, now_utc)
                     elif source_name == "adzuna":

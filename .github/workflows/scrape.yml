@@ -12,6 +12,7 @@ jobs:
       SHEET_ID: ${{ vars.SHEET_ID }}
       CREDS_FILE: service_account.json
       KEYWORDS: ${{ vars.KEYWORDS }}
+      GREENHOUSE_BOARDS: ${{ vars.GREENHOUSE_BOARDS }}
       MAX_PAGES_PER_KEYWORD: ${{ vars.MAX_PAGES_PER_KEYWORD }}
       MAX_POST_AGE_DAYS: ${{ vars.MAX_POST_AGE_DAYS }}
       PAGE_DELAY_RANGE_SECONDS: ${{ vars.PAGE_DELAY_RANGE_SECONDS }}

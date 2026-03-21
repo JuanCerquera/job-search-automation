@@ -5,11 +5,13 @@ import threading
 import time
 import json
 import traceback
+import urllib.error
+import urllib.request
 from datetime import date, datetime, timedelta, timezone
 from functools import lru_cache
 from pathlib import Path
 from typing import Dict, List, Tuple, Any
-from urllib.parse import quote_plus
+from urllib.parse import quote, quote_plus
 
 import gspread
 from google.auth.transport.requests import Request
@@ -105,6 +107,10 @@ DEFAULT_KEYWORDS = [
 # "Keyword A|Keyword B|Keyword C"
 KEYWORDS_ENV = os.getenv("KEYWORDS", "").strip()
 KEYWORDS = [k.strip() for k in KEYWORDS_ENV.split("|") if k.strip()] if KEYWORDS_ENV else DEFAULT_KEYWORDS
+GREENHOUSE_BOARDS_ENV = os.getenv("GREENHOUSE_BOARDS", "").strip()
+GREENHOUSE_BOARDS = [
+    board.strip() for board in GREENHOUSE_BOARDS_ENV.replace(",", "|").split("|") if board.strip()
+]
 
 HEADERS = [
     "Job URL",
@@ -597,9 +603,112 @@ def scrape_keyword_jobs(page, keyword: str, now_utc: datetime) -> tuple[List[Dic
     )
     return jobs, {
         "keyword": keyword,
+        "source": SOURCE_NAME,
         "pages_scanned": pages_scanned,
         "page_timeouts": page_timeouts,
         "no_results_pages": no_results_pages,
+        "rows_collected": len(jobs),
+        "skipped_old": skipped_old,
+        "kept_unknown_date": kept_unknown_date,
+        "missing_url": skipped_missing_url,
+        "skipped_term_filter": skipped_term_filter,
+    }
+
+
+def scrape_greenhouse_board_jobs(board_token: str, now_utc: datetime) -> tuple[List[Dict[str, str]], Dict[str, Any]]:
+    jobs: List[Dict[str, str]] = []
+    skipped_old = 0
+    kept_unknown_date = 0
+    skipped_missing_url = 0
+    skipped_term_filter = 0
+    fetch_errors = 0
+
+    log(f"=== Scraping Greenhouse board: {board_token} ===")
+    api_url = f"https://boards-api.greenhouse.io/v1/boards/{quote(board_token)}/jobs?content=true"
+
+    try:
+        with urllib.request.urlopen(api_url, timeout=45) as response:
+            payload = json.loads(response.read().decode("utf-8"))
+    except (urllib.error.URLError, TimeoutError, json.JSONDecodeError) as exc:
+        log(f"Failed to fetch Greenhouse board '{board_token}': {exc}")
+        fetch_errors += 1
+        return [], {
+            "keyword": f"greenhouse:{board_token}",
+            "source": "greenhouse",
+            "pages_scanned": 1,
+            "page_timeouts": fetch_errors,
+            "no_results_pages": 0,
+            "rows_collected": 0,
+            "skipped_old": 0,
+            "kept_unknown_date": 0,
+            "missing_url": 0,
+            "skipped_term_filter": 0,
+        }
+
+    raw_jobs = payload.get("jobs", []) if isinstance(payload, dict) else []
+    if not raw_jobs:
+        log(f"Greenhouse board '{board_token}' returned 0 jobs.")
+
+    page_seen_urls = set()
+    for raw_job in raw_jobs:
+        title = (raw_job.get("title") or "").strip()
+        if not _title_matches_term_filters(title):
+            skipped_term_filter += 1
+            continue
+
+        location = ""
+        raw_location = raw_job.get("location")
+        if isinstance(raw_location, dict):
+            location = (raw_location.get("name") or "").strip()
+
+        posted_date = (raw_job.get("updated_at") or raw_job.get("first_published") or "").strip()
+        is_recent, is_unknown_date = _is_recent_enough(posted_date, now_utc)
+        if is_unknown_date:
+            kept_unknown_date += 1
+        if not is_recent:
+            skipped_old += 1
+            continue
+
+        job_url = (raw_job.get("absolute_url") or "").strip()
+        if not job_url:
+            raw_id = str(raw_job.get("id") or "").strip()
+            if raw_id:
+                job_url = f"https://boards.greenhouse.io/{board_token}/jobs/{raw_id}"
+        if not job_url:
+            skipped_missing_url += 1
+            continue
+
+        normalized_job_url = _normalize_job_url(job_url)
+        if normalized_job_url in page_seen_urls:
+            continue
+        page_seen_urls.add(normalized_job_url)
+
+        company_name = board_token.replace("-", " ").strip().title()
+        jobs.append(
+            {
+                "title": title,
+                "company": company_name,
+                "location": location,
+                "date_posted": posted_date,
+                "job_url": normalized_job_url,
+                "keyword": f"greenhouse:{board_token}",
+                "source": "greenhouse",
+                "source_job_id": str(raw_job.get("id") or "").strip(),
+                "canonical_key": _build_canonical_key(title, company_name, location),
+            }
+        )
+
+    log(
+        f"Collected {len(jobs)} Greenhouse rows for '{board_token}'. "
+        f"Skipped old: {skipped_old}, kept unknown-date: {kept_unknown_date}, "
+        f"missing URL: {skipped_missing_url}, title-term-filter: {skipped_term_filter}"
+    )
+    return jobs, {
+        "keyword": f"greenhouse:{board_token}",
+        "source": "greenhouse",
+        "pages_scanned": 1,
+        "page_timeouts": fetch_errors,
+        "no_results_pages": 1 if not raw_jobs else 0,
         "rows_collected": len(jobs),
         "skipped_old": skipped_old,
         "kept_unknown_date": kept_unknown_date,
@@ -766,6 +875,36 @@ def write_row_updates(worksheet, row_updates: Dict[int, List[str]]) -> None:
     log(f"Updated {len(data)} existing rows in tab '{worksheet.title}'.")
 
 
+def build_source_summary(keyword_summaries: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    aggregated: Dict[str, Dict[str, Any]] = {}
+    tracked_fields = [
+        "rows_collected",
+        "new_rows_appended",
+        "duplicates_skipped",
+        "merged_existing_rows",
+        "merged_by_job_url",
+        "merged_by_canonical_key",
+        "canonical_duplicates_in_run",
+        "canonical_duplicates_against_existing",
+        "skipped_old",
+        "skipped_term_filter",
+        "page_timeouts",
+    ]
+
+    for item in keyword_summaries:
+        source_name = str(item.get("source", "unknown"))
+        if source_name not in aggregated:
+            aggregated[source_name] = {"source": source_name, "batches": 0}
+            for field in tracked_fields:
+                aggregated[source_name][field] = 0
+
+        aggregated[source_name]["batches"] += 1
+        for field in tracked_fields:
+            aggregated[source_name][field] += int(item.get(field, 0))
+
+    return [aggregated[key] for key in sorted(aggregated.keys())]
+
+
 def get_next_empty_row(worksheet) -> int:
     # Column A always contains Job URL for populated rows.
     # Using col_values keeps writes contiguous within the existing table block.
@@ -794,8 +933,9 @@ def write_rows_to_next_empty_range(worksheet, rows: List[List[str]]) -> None:
 
 def main() -> None:
     started_at = datetime.utcnow()
+    total_batches = len(KEYWORDS) + len(GREENHOUSE_BOARDS)
     summary: Dict[str, Any] = {
-        "phase": "phase2_merge_writes",
+        "phase": "phase3_multi_source",
         "status": "running",
         "started_at_utc": started_at.isoformat() + "Z",
         "finished_at_utc": "",
@@ -803,7 +943,7 @@ def main() -> None:
         "sheet_id": SHEET_ID,
         "worksheet_name": WORKSHEET_NAME,
         "keyword_source": "KEYWORDS env var" if KEYWORDS_ENV else "DEFAULT_KEYWORDS list",
-        "keywords_total": len(KEYWORDS),
+        "keywords_total": total_batches,
         "keywords_processed": 0,
         "runtime_config": {
             "MAX_PAGES_PER_KEYWORD": MAX_PAGES_PER_KEYWORD,
@@ -812,6 +952,7 @@ def main() -> None:
             "KEYWORD_DELAY_RANGE_SECONDS": list(KEYWORD_DELAY_RANGE_SECONDS),
             "HEARTBEAT_INTERVAL_SECONDS": HEARTBEAT_INTERVAL_SECONDS,
             "TITLE_FILTER_EXPRESSION": TITLE_FILTER_EXPRESSION,
+            "GREENHOUSE_BOARDS": GREENHOUSE_BOARDS,
         },
         "totals": {
             "rows_collected_before_dedupe": 0,
@@ -830,6 +971,7 @@ def main() -> None:
             "no_results_pages": 0,
         },
         "keywords": [],
+        "sources": [],
         "error": "",
         "traceback": "",
     }
@@ -843,6 +985,7 @@ def main() -> None:
         f"Keyword source: {'KEYWORDS env var' if KEYWORDS_ENV else 'DEFAULT_KEYWORDS list'}. "
         f"Total keywords: {len(KEYWORDS)}"
     )
+    log(f"Greenhouse boards configured: {len(GREENHOUSE_BOARDS)}")
     log(f"Date filter: jobs posted within the last {MAX_POST_AGE_DAYS} days.")
     log(
         "Runtime config: "
@@ -881,56 +1024,64 @@ def main() -> None:
                 viewport={"width": 1366, "height": 768},
             )
             page = context.new_page()
+            def process_jobs_batch(
+                batch_label: str, batch_jobs: List[Dict[str, str]], batch_stats: Dict[str, Any]
+            ) -> None:
+                nonlocal total_new_rows
+                nonlocal total_duplicates_skipped
+                nonlocal total_merged_existing_rows
+                nonlocal total_merged_by_job_url
+                nonlocal total_merged_by_canonical
+                nonlocal total_canonical_dupes_in_run
+                nonlocal total_canonical_dupes_against_existing
 
-            for idx, keyword in enumerate(KEYWORDS):
-                log(f"Starting keyword {idx + 1}/{len(KEYWORDS)}: {keyword}")
+                batch_rows_to_append: List[List[str]] = []
+                batch_duplicates_skipped = 0
+                batch_merged_existing_rows = 0
+                batch_merged_by_job_url = 0
+                batch_merged_by_canonical = 0
+                batch_canonical_dupes_in_run = 0
+                batch_canonical_dupes_against_existing = 0
+                batch_row_updates: Dict[int, List[str]] = {}
 
-                keyword_jobs, keyword_stats = scrape_keyword_jobs(page, keyword, now_utc)
-                keyword_rows_to_append: List[List[str]] = []
-                keyword_duplicates_skipped = 0
-                keyword_merged_existing_rows = 0
-                keyword_merged_by_job_url = 0
-                keyword_merged_by_canonical = 0
-                keyword_canonical_dupes_in_run = 0
-                keyword_canonical_dupes_against_existing = 0
-                keyword_row_updates: Dict[int, List[str]] = {}
-
-                for job in keyword_jobs:
+                for job in batch_jobs:
                     job_url = job["job_url"]
                     canonical_key = job.get("canonical_key", "")
 
                     if canonical_key:
                         if canonical_key in run_seen_canonical_keys:
-                            keyword_canonical_dupes_in_run += 1
+                            batch_canonical_dupes_in_run += 1
                         else:
                             run_seen_canonical_keys.add(canonical_key)
 
                         if canonical_key in by_canonical_key:
-                            keyword_canonical_dupes_against_existing += 1
+                            batch_canonical_dupes_against_existing += 1
 
                     # Deduplicate against rows staged for append in this run.
                     if job_url in staged_new_job_urls:
-                        keyword_duplicates_skipped += 1
+                        batch_duplicates_skipped += 1
                         continue
                     if canonical_key and canonical_key in staged_new_canonical_keys:
-                        keyword_duplicates_skipped += 1
+                        batch_duplicates_skipped += 1
                         continue
 
                     matched_row_number = None
                     if job_url in by_job_url:
                         matched_row_number = by_job_url[job_url]
-                        keyword_merged_by_job_url += 1
+                        batch_merged_by_job_url += 1
                     elif canonical_key and canonical_key in by_canonical_key:
                         matched_row_number = by_canonical_key[canonical_key]
-                        keyword_merged_by_canonical += 1
+                        batch_merged_by_canonical += 1
+
+                    row_keyword = job.get("keyword", batch_label)
 
                     if matched_row_number is not None:
-                        keyword_duplicates_skipped += 1
-                        keyword_merged_existing_rows += 1
+                        batch_duplicates_skipped += 1
+                        batch_merged_existing_rows += 1
                         existing_row = rows_by_number.get(matched_row_number, [""] * len(HEADERS))
-                        merged_row = merge_job_into_existing_row(existing_row, job, keyword, date_added)
+                        merged_row = merge_job_into_existing_row(existing_row, job, row_keyword, date_added)
                         rows_by_number[matched_row_number] = merged_row
-                        keyword_row_updates[matched_row_number] = merged_row
+                        batch_row_updates[matched_row_number] = merged_row
                         by_job_url[job_url] = matched_row_number
                         canonical_after_merge = merged_row[10].strip()
                         if canonical_after_merge and canonical_after_merge not in by_canonical_key:
@@ -944,7 +1095,7 @@ def main() -> None:
                         job["company"],
                         job["location"],
                         job["date_posted"],
-                        keyword,
+                        row_keyword,
                         date_added,
                         job.get("source", SOURCE_NAME),
                         job.get("source_job_id", ""),
@@ -953,56 +1104,74 @@ def main() -> None:
                         date_added,
                         date_added,
                     ]
-                    keyword_rows_to_append.append(new_row)
+                    batch_rows_to_append.append(new_row)
                     staged_new_job_urls.add(job_url)
                     if canonical_key:
                         staged_new_canonical_keys.add(canonical_key)
 
-                if keyword_row_updates:
-                    write_row_updates(worksheet, keyword_row_updates)
+                if batch_row_updates:
+                    write_row_updates(worksheet, batch_row_updates)
 
-                if keyword_rows_to_append:
+                if batch_rows_to_append:
                     log(
-                        f"Appending {len(keyword_rows_to_append)} rows to tab '{worksheet.title}' "
-                        f"for keyword '{keyword}'."
+                        f"Appending {len(batch_rows_to_append)} rows to tab '{worksheet.title}' "
+                        f"for batch '{batch_label}'."
                     )
-                    write_rows_to_next_empty_range(worksheet, keyword_rows_to_append)
-                    log(f"Appended {len(keyword_rows_to_append)} rows to tab '{worksheet.title}'.")
+                    write_rows_to_next_empty_range(worksheet, batch_rows_to_append)
+                    log(f"Appended {len(batch_rows_to_append)} rows to tab '{worksheet.title}'.")
                 else:
-                    log(f"No new rows to append for keyword '{keyword}'.")
+                    log(f"No new rows to append for batch '{batch_label}'.")
 
-                total_new_rows += len(keyword_rows_to_append)
-                total_duplicates_skipped += keyword_duplicates_skipped
-                total_merged_existing_rows += keyword_merged_existing_rows
-                total_merged_by_job_url += keyword_merged_by_job_url
-                total_merged_by_canonical += keyword_merged_by_canonical
-                total_canonical_dupes_in_run += keyword_canonical_dupes_in_run
-                total_canonical_dupes_against_existing += keyword_canonical_dupes_against_existing
+                total_new_rows += len(batch_rows_to_append)
+                total_duplicates_skipped += batch_duplicates_skipped
+                total_merged_existing_rows += batch_merged_existing_rows
+                total_merged_by_job_url += batch_merged_by_job_url
+                total_merged_by_canonical += batch_merged_by_canonical
+                total_canonical_dupes_in_run += batch_canonical_dupes_in_run
+                total_canonical_dupes_against_existing += batch_canonical_dupes_against_existing
+                source_name = str(
+                    batch_stats.get("source")
+                    or (batch_jobs[0].get("source") if batch_jobs else SOURCE_NAME)
+                )
                 summary["keywords"].append(
                     {
-                        **keyword_stats,
-                        "new_rows_appended": len(keyword_rows_to_append),
-                        "duplicates_skipped": keyword_duplicates_skipped,
-                        "merged_existing_rows": keyword_merged_existing_rows,
-                        "merged_by_job_url": keyword_merged_by_job_url,
-                        "merged_by_canonical_key": keyword_merged_by_canonical,
-                        "canonical_duplicates_in_run": keyword_canonical_dupes_in_run,
-                        "canonical_duplicates_against_existing": keyword_canonical_dupes_against_existing,
+                        **batch_stats,
+                        "source": source_name,
+                        "new_rows_appended": len(batch_rows_to_append),
+                        "duplicates_skipped": batch_duplicates_skipped,
+                        "merged_existing_rows": batch_merged_existing_rows,
+                        "merged_by_job_url": batch_merged_by_job_url,
+                        "merged_by_canonical_key": batch_merged_by_canonical,
+                        "canonical_duplicates_in_run": batch_canonical_dupes_in_run,
+                        "canonical_duplicates_against_existing": batch_canonical_dupes_against_existing,
                     }
                 )
                 summary["keywords_processed"] = len(summary["keywords"])
 
                 log(
-                    f"Keyword complete: {keyword}. New rows: {len(keyword_rows_to_append)}. "
-                    f"Duplicates skipped: {keyword_duplicates_skipped}. "
-                    f"Merged existing rows: {keyword_merged_existing_rows} "
-                    f"(url={keyword_merged_by_job_url}, canonical={keyword_merged_by_canonical}). "
-                    f"Canonical dupes in run: {keyword_canonical_dupes_in_run}. "
-                    f"Canonical dupes vs existing: {keyword_canonical_dupes_against_existing}"
+                    f"Batch complete: {batch_label}. New rows: {len(batch_rows_to_append)}. "
+                    f"Duplicates skipped: {batch_duplicates_skipped}. "
+                    f"Merged existing rows: {batch_merged_existing_rows} "
+                    f"(url={batch_merged_by_job_url}, canonical={batch_merged_by_canonical}). "
+                    f"Canonical dupes in run: {batch_canonical_dupes_in_run}. "
+                    f"Canonical dupes vs existing: {batch_canonical_dupes_against_existing}"
                 )
 
-                if idx < len(KEYWORDS) - 1:
-                    _sleep_random(KEYWORD_DELAY_RANGE_SECONDS, "between keywords")
+            for idx, keyword in enumerate(KEYWORDS):
+                log(f"Starting LinkedIn keyword {idx + 1}/{len(KEYWORDS)}: {keyword}")
+                keyword_jobs, keyword_stats = scrape_keyword_jobs(page, keyword, now_utc)
+                process_jobs_batch(keyword, keyword_jobs, keyword_stats)
+
+                if idx < len(KEYWORDS) - 1 or GREENHOUSE_BOARDS:
+                    _sleep_random(KEYWORD_DELAY_RANGE_SECONDS, "between source batches")
+
+            for board_idx, board_token in enumerate(GREENHOUSE_BOARDS):
+                log(f"Starting Greenhouse board {board_idx + 1}/{len(GREENHOUSE_BOARDS)}: {board_token}")
+                board_jobs, board_stats = scrape_greenhouse_board_jobs(board_token, now_utc)
+                process_jobs_batch(f"greenhouse:{board_token}", board_jobs, board_stats)
+
+                if board_idx < len(GREENHOUSE_BOARDS) - 1:
+                    _sleep_random(KEYWORD_DELAY_RANGE_SECONDS, "between greenhouse boards")
 
             context.close()
             browser.close()
@@ -1024,6 +1193,7 @@ def main() -> None:
             "page_timeouts": sum(int(item["page_timeouts"]) for item in summary["keywords"]),
             "no_results_pages": sum(int(item["no_results_pages"]) for item in summary["keywords"]),
         }
+        summary["sources"] = build_source_summary(summary["keywords"])
         summary["status"] = "success"
 
         log(
@@ -1038,6 +1208,7 @@ def main() -> None:
         summary["status"] = "failed"
         summary["error"] = str(exc)
         summary["traceback"] = traceback.format_exc()
+        summary["sources"] = build_source_summary(summary["keywords"])
         log(f"Scraper failed: {exc}")
         raise
     finally:

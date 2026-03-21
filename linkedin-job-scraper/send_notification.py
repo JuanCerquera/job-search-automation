@@ -93,6 +93,22 @@ def _build_keyword_table_rows(summary: Dict[str, Any]) -> str:
     return "".join(rows) if rows else "<tr><td colspan='12'>No keyword details available</td></tr>"
 
 
+def _build_source_table_rows(summary: Dict[str, Any]) -> str:
+    rows = []
+    for item in summary.get("sources", []) or []:
+        rows.append(
+            "<tr>"
+            f"<td>{escape(str(item.get('source', '')))}</td>"
+            f"<td>{int(item.get('batches', 0))}</td>"
+            f"<td>{int(item.get('rows_collected', 0))}</td>"
+            f"<td>{int(item.get('new_rows_appended', 0))}</td>"
+            f"<td>{int(item.get('merged_existing_rows', 0))}</td>"
+            f"<td>{int(item.get('duplicates_skipped', 0))}</td>"
+            "</tr>"
+        )
+    return "".join(rows) if rows else "<tr><td colspan='6'>No source summary available</td></tr>"
+
+
 def _build_html(summary: Dict[str, Any]) -> str:
     totals = summary.get("totals", {}) or {}
     status = escape(str(summary.get("status", RUN_STATUS or "unknown")).upper())
@@ -127,6 +143,18 @@ def _build_html(summary: Dict[str, Any]) -> str:
     </table>
     {run_link_html}
     {error_html}
+    <h4 style="margin: 12px 0 6px 0;">Per-source summary</h4>
+    <table cellpadding="5" cellspacing="0" border="1" style="border-collapse: collapse; margin-bottom: 10px;">
+      <tr>
+        <th>Source</th>
+        <th>Batches</th>
+        <th>Collected</th>
+        <th>New</th>
+        <th>Merged</th>
+        <th>Dupes</th>
+      </tr>
+      {_build_source_table_rows(summary)}
+    </table>
     <h4 style="margin: 12px 0 6px 0;">Per-keyword summary</h4>
     <table cellpadding="5" cellspacing="0" border="1" style="border-collapse: collapse;">
       <tr>
@@ -176,6 +204,19 @@ def _build_text(summary: Dict[str, Any]) -> str:
         lines.append(f"Run URL: {run_url}")
     if summary.get("error"):
         lines.append(f"Error: {summary.get('error')}")
+
+    lines.append("")
+    lines.append("Per-source summary:")
+    for item in summary.get("sources", []) or []:
+        lines.append(
+            "- "
+            f"{item.get('source', '')}: "
+            f"batches={int(item.get('batches', 0))}, "
+            f"collected={int(item.get('rows_collected', 0))}, "
+            f"new={int(item.get('new_rows_appended', 0))}, "
+            f"merged={int(item.get('merged_existing_rows', 0))}, "
+            f"dupes={int(item.get('duplicates_skipped', 0))}"
+        )
 
     lines.append("")
     lines.append("Per-keyword summary:")

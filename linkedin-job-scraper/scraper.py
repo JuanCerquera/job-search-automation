@@ -269,43 +269,13 @@ def _normalized_text_for_term_matching(value: str) -> str:
     return re.sub(r"[^a-z0-9]+", "", value.lower())
 
 
-def _tokenize_words(value: str) -> List[str]:
-    return re.findall(r"[a-z0-9]+", value.lower())
-
-
-def _contains_token_sequence(words: List[str], sequence: List[str]) -> bool:
-    if not sequence or len(sequence) > len(words):
+def _term_matches_title(term: str, title_lower: str, title_compact: str) -> bool:
+    term_lower = term.lower().strip()
+    if not term_lower:
         return False
-    window = len(sequence)
-    for i in range(len(words) - window + 1):
-        if words[i : i + window] == sequence:
-            return True
-    return False
-
-
-def _term_matches_title(term: str, title_words: List[str], title_compact: str) -> bool:
-    term_words = _tokenize_words(term)
-    if not term_words:
-        return False
-
-    if len(term_words) > 1:
-        # Multi-word terms (e.g. "co-op", "machine learning") should match
-        # contiguous word sequences in the title.
-        if _contains_token_sequence(title_words, term_words):
-            return True
-        term_compact = _normalized_text_for_term_matching(" ".join(term_words))
-        return term_compact in title_compact
-
-    term_word = term_words[0]
-    if term_word in title_words:
+    if term_lower in title_lower:
         return True
-
-    # For longer single words, allow prefix matching:
-    # - robot -> robotics
-    # - grad -> graduate
-    if len(term_word) >= 4 and any(word.startswith(term_word) for word in title_words):
-        return True
-    return False
+    return _normalized_text_for_term_matching(term_lower) in title_compact
 
 
 def _tokenize_filter_expression(expression: str) -> List[str]:
@@ -400,17 +370,17 @@ class _ExprParser:
         return ("term", term)
 
 
-def _evaluate_filter_ast(node, title_words: List[str], title_compact: str) -> bool:
+def _evaluate_filter_ast(node, title_lower: str, title_compact: str) -> bool:
     node_type = node[0]
     if node_type == "term":
-        return _term_matches_title(node[1], title_words, title_compact)
+        return _term_matches_title(node[1], title_lower, title_compact)
     if node_type == "and":
-        return _evaluate_filter_ast(node[1], title_words, title_compact) and _evaluate_filter_ast(
-            node[2], title_words, title_compact
+        return _evaluate_filter_ast(node[1], title_lower, title_compact) and _evaluate_filter_ast(
+            node[2], title_lower, title_compact
         )
     if node_type == "or":
-        return _evaluate_filter_ast(node[1], title_words, title_compact) or _evaluate_filter_ast(
-            node[2], title_words, title_compact
+        return _evaluate_filter_ast(node[1], title_lower, title_compact) or _evaluate_filter_ast(
+            node[2], title_lower, title_compact
         )
     raise ValueError(f"Unknown expression node type: {node_type}")
 
@@ -427,12 +397,12 @@ def _get_title_filter_ast():
 
 
 def _title_matches_term_filters(title: str) -> bool:
-    title_words = _tokenize_words(title)
+    title_lower = title.lower()
     title_compact = _normalized_text_for_term_matching(title)
     expression_ast = _get_title_filter_ast()
     if expression_ast is None:
         return True
-    return _evaluate_filter_ast(expression_ast, title_words, title_compact)
+    return _evaluate_filter_ast(expression_ast, title_lower, title_compact)
 
 
 def _parse_posted_datetime(posted_value: str, now_utc: datetime) -> datetime | None:

@@ -80,12 +80,14 @@ def _build_keyword_table_rows(summary: Dict[str, Any]) -> str:
             f"<td>{int(item.get('rows_collected', 0))}</td>"
             f"<td>{int(item.get('new_rows_appended', 0))}</td>"
             f"<td>{int(item.get('duplicates_skipped', 0))}</td>"
+            f"<td>{int(item.get('canonical_duplicates_in_run', 0))}</td>"
+            f"<td>{int(item.get('canonical_duplicates_against_existing', 0))}</td>"
             f"<td>{int(item.get('skipped_old', 0))}</td>"
             f"<td>{int(item.get('skipped_term_filter', 0))}</td>"
             f"<td>{int(item.get('page_timeouts', 0))}</td>"
             "</tr>"
         )
-    return "".join(rows) if rows else "<tr><td colspan='7'>No keyword details available</td></tr>"
+    return "".join(rows) if rows else "<tr><td colspan='9'>No keyword details available</td></tr>"
 
 
 def _build_html(summary: Dict[str, Any]) -> str:
@@ -110,6 +112,8 @@ def _build_html(summary: Dict[str, Any]) -> str:
       <tr><td><b>Collected (pre-dedupe)</b></td><td>{int(totals.get("rows_collected_before_dedupe", 0))}</td></tr>
       <tr><td><b>New Rows Appended</b></td><td>{int(totals.get("new_rows_appended", 0))}</td></tr>
       <tr><td><b>Duplicates Skipped</b></td><td>{int(totals.get("duplicates_skipped", 0))}</td></tr>
+      <tr><td><b>Canonical Duplicates (Run)</b></td><td>{int(totals.get("canonical_duplicates_in_run", 0))}</td></tr>
+      <tr><td><b>Canonical Duplicates (Existing)</b></td><td>{int(totals.get("canonical_duplicates_against_existing", 0))}</td></tr>
       <tr><td><b>Old Skipped</b></td><td>{int(totals.get("skipped_old", 0))}</td></tr>
       <tr><td><b>Title Filter Skipped</b></td><td>{int(totals.get("skipped_term_filter", 0))}</td></tr>
       <tr><td><b>Unknown Date Kept</b></td><td>{int(totals.get("kept_unknown_date", 0))}</td></tr>
@@ -124,6 +128,8 @@ def _build_html(summary: Dict[str, Any]) -> str:
         <th>Collected</th>
         <th>New</th>
         <th>Dupes</th>
+        <th>Canon Run</th>
+        <th>Canon Existing</th>
         <th>Old</th>
         <th>Title Filter</th>
         <th>Timeouts</th>
@@ -146,6 +152,8 @@ def _build_text(summary: Dict[str, Any]) -> str:
         f"Collected (pre-dedupe): {int(totals.get('rows_collected_before_dedupe', 0))}",
         f"New Rows Appended: {int(totals.get('new_rows_appended', 0))}",
         f"Duplicates Skipped: {int(totals.get('duplicates_skipped', 0))}",
+        f"Canonical Duplicates (Run): {int(totals.get('canonical_duplicates_in_run', 0))}",
+        f"Canonical Duplicates (Existing): {int(totals.get('canonical_duplicates_against_existing', 0))}",
         f"Old Skipped: {int(totals.get('skipped_old', 0))}",
         f"Title Filter Skipped: {int(totals.get('skipped_term_filter', 0))}",
         f"Unknown Date Kept: {int(totals.get('kept_unknown_date', 0))}",
@@ -166,6 +174,8 @@ def _build_text(summary: Dict[str, Any]) -> str:
             f"collected={int(item.get('rows_collected', 0))}, "
             f"new={int(item.get('new_rows_appended', 0))}, "
             f"dupes={int(item.get('duplicates_skipped', 0))}, "
+            f"canon_run={int(item.get('canonical_duplicates_in_run', 0))}, "
+            f"canon_existing={int(item.get('canonical_duplicates_against_existing', 0))}, "
             f"old={int(item.get('skipped_old', 0))}, "
             f"title_filter={int(item.get('skipped_term_filter', 0))}, "
             f"timeouts={int(item.get('page_timeouts', 0))}"

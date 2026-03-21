@@ -22,6 +22,7 @@ SHEET_ID = os.getenv("SHEET_ID", "").strip()
 CREDS_FILE = os.getenv("CREDS_FILE", "service_account.json").strip()
 WORKSHEET_NAME = "Jobs"
 RUN_SUMMARY_FILE = os.getenv("RUN_SUMMARY_FILE", "scraper_run_summary.json").strip()
+SOURCE_NAME = "linkedin"
 
 RESULTS_PER_PAGE = 25
 
@@ -176,6 +177,24 @@ def _build_search_url(keyword: str, start: int) -> str:
 
 def _normalize_job_url(url: str) -> str:
     return url.split("?", 1)[0].rstrip("/")
+
+
+def _normalize_for_fingerprint(value: str) -> str:
+    cleaned = re.sub(r"[^a-z0-9]+", " ", value.lower())
+    return " ".join(cleaned.split())
+
+
+def _build_canonical_key(title: str, company: str, location: str) -> str:
+    title_norm = _normalize_for_fingerprint(title)
+    company_norm = _normalize_for_fingerprint(company)
+    location_norm = _normalize_for_fingerprint(location)
+    return f"{title_norm}|{company_norm}|{location_norm}"
+
+
+def _extract_linkedin_job_id(job_url: str) -> str:
+    # Supports URLs like /jobs/view/<slug>-1234567890 and /jobs/view/1234567890
+    match = re.search(r"/jobs/view/(?:[^/?#]*-)?(\d+)", job_url)
+    return match.group(1) if match else ""
 
 
 def _normalized_text_for_term_matching(value: str) -> str:
@@ -538,6 +557,9 @@ def scrape_keyword_jobs(page, keyword: str, now_utc: datetime) -> tuple[List[Dic
                     "date_posted": posted_date,
                     "job_url": normalized_job_url,
                     "keyword": keyword,
+                    "source": SOURCE_NAME,
+                    "source_job_id": _extract_linkedin_job_id(normalized_job_url),
+                    "canonical_key": _build_canonical_key(title, company, location),
                 }
             )
 
@@ -639,6 +661,23 @@ def get_existing_job_urls(worksheet) -> set[str]:
     return existing_urls
 
 
+def get_existing_canonical_keys(worksheet) -> set[str]:
+    rows = worksheet.get_all_values()
+    canonical_keys = set()
+    for row in rows[1:]:
+        if len(row) < 5:
+            continue
+        # Current schema: Job URL, Application Date, Job Title, Company, Location, ...
+        title = row[2].strip()
+        company = row[3].strip()
+        location = row[4].strip()
+        canonical_key = _build_canonical_key(title, company, location)
+        if canonical_key != "||":
+            canonical_keys.add(canonical_key)
+    log(f"Loaded {len(canonical_keys)} canonical keys from tab '{worksheet.title}'")
+    return canonical_keys
+
+
 def get_next_empty_row(worksheet) -> int:
     # Column A always contains Job URL for populated rows.
     # Using col_values keeps writes contiguous within the existing table block.
@@ -667,6 +706,7 @@ def write_rows_to_next_empty_range(worksheet, rows: List[List[str]]) -> None:
 def main() -> None:
     started_at = datetime.utcnow()
     summary: Dict[str, Any] = {
+        "phase": "phase1_source_aware_report_only",
         "status": "running",
         "started_at_utc": started_at.isoformat() + "Z",
         "finished_at_utc": "",
@@ -688,6 +728,8 @@ def main() -> None:
             "rows_collected_before_dedupe": 0,
             "new_rows_appended": 0,
             "duplicates_skipped": 0,
+            "canonical_duplicates_in_run": 0,
+            "canonical_duplicates_against_existing": 0,
             "skipped_old": 0,
             "kept_unknown_date": 0,
             "missing_url": 0,
@@ -724,11 +766,15 @@ def main() -> None:
         worksheet = get_jobs_worksheet(spreadsheet)
         ensure_headers(worksheet)
         existing_urls = get_existing_job_urls(worksheet)
+        existing_canonical_keys = get_existing_canonical_keys(worksheet)
         date_added = date.today().isoformat()
         now_utc = datetime.utcnow()
 
         total_new_rows = 0
         total_duplicates_skipped = 0
+        total_canonical_dupes_in_run = 0
+        total_canonical_dupes_against_existing = 0
+        run_seen_canonical_keys = set()
 
         with sync_playwright() as playwright:
             log("Launching Playwright Chromium in headless mode.")
@@ -746,9 +792,22 @@ def main() -> None:
                 keyword_jobs, keyword_stats = scrape_keyword_jobs(page, keyword, now_utc)
                 keyword_rows_to_append: List[List[str]] = []
                 keyword_duplicates_skipped = 0
+                keyword_canonical_dupes_in_run = 0
+                keyword_canonical_dupes_against_existing = 0
 
                 for job in keyword_jobs:
                     job_url = job["job_url"]
+                    canonical_key = job.get("canonical_key", "")
+
+                    if canonical_key:
+                        if canonical_key in run_seen_canonical_keys:
+                            keyword_canonical_dupes_in_run += 1
+                        else:
+                            run_seen_canonical_keys.add(canonical_key)
+
+                        if canonical_key in existing_canonical_keys:
+                            keyword_canonical_dupes_against_existing += 1
+
                     if job_url in existing_urls:
                         keyword_duplicates_skipped += 1
                         continue
@@ -779,18 +838,24 @@ def main() -> None:
 
                 total_new_rows += len(keyword_rows_to_append)
                 total_duplicates_skipped += keyword_duplicates_skipped
+                total_canonical_dupes_in_run += keyword_canonical_dupes_in_run
+                total_canonical_dupes_against_existing += keyword_canonical_dupes_against_existing
                 summary["keywords"].append(
                     {
                         **keyword_stats,
                         "new_rows_appended": len(keyword_rows_to_append),
                         "duplicates_skipped": keyword_duplicates_skipped,
+                        "canonical_duplicates_in_run": keyword_canonical_dupes_in_run,
+                        "canonical_duplicates_against_existing": keyword_canonical_dupes_against_existing,
                     }
                 )
                 summary["keywords_processed"] = len(summary["keywords"])
 
                 log(
                     f"Keyword complete: {keyword}. New rows: {len(keyword_rows_to_append)}. "
-                    f"Duplicates skipped: {keyword_duplicates_skipped}"
+                    f"Duplicates skipped: {keyword_duplicates_skipped}. "
+                    f"Canonical dupes in run: {keyword_canonical_dupes_in_run}. "
+                    f"Canonical dupes vs existing: {keyword_canonical_dupes_against_existing}"
                 )
 
                 if idx < len(KEYWORDS) - 1:
@@ -804,6 +869,8 @@ def main() -> None:
             "rows_collected_before_dedupe": sum(int(item["rows_collected"]) for item in summary["keywords"]),
             "new_rows_appended": total_new_rows,
             "duplicates_skipped": total_duplicates_skipped,
+            "canonical_duplicates_in_run": total_canonical_dupes_in_run,
+            "canonical_duplicates_against_existing": total_canonical_dupes_against_existing,
             "skipped_old": sum(int(item["skipped_old"]) for item in summary["keywords"]),
             "kept_unknown_date": sum(int(item["kept_unknown_date"]) for item in summary["keywords"]),
             "missing_url": sum(int(item["missing_url"]) for item in summary["keywords"]),
@@ -815,7 +882,9 @@ def main() -> None:
 
         log(
             f"Scraper finished. Total new rows: {total_new_rows}. "
-            f"Total duplicates skipped: {total_duplicates_skipped}"
+            f"Total duplicates skipped: {total_duplicates_skipped}. "
+            f"Canonical dupes in run: {total_canonical_dupes_in_run}. "
+            f"Canonical dupes vs existing: {total_canonical_dupes_against_existing}"
         )
     except Exception as exc:
         summary["status"] = "failed"

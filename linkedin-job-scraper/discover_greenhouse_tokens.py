@@ -13,26 +13,42 @@ from google.auth.transport.requests import Request
 from google.oauth2 import service_account
 from gspread.exceptions import WorksheetNotFound
 
-SHEET_ID = os.getenv("SHEET_ID", "").strip()
-CREDS_FILE = os.getenv("CREDS_FILE", "service_account.json").strip()
-JOBS_WORKSHEET_NAME = os.getenv("JOBS_WORKSHEET_NAME", "Jobs").strip()
-TOKENS_WORKSHEET_NAME = os.getenv("GREENHOUSE_TOKENS_WORKSHEET", "GreenhouseTokens").strip()
-DISCOVERY_ENABLED = os.getenv("GREENHOUSE_DISCOVERY_ENABLED", "true").strip().lower() in {
-    "1",
-    "true",
-    "yes",
-    "on",
-}
-MAX_URLS_TO_SCAN = int(os.getenv("GREENHOUSE_DISCOVERY_MAX_URLS", "400"))
-HTTP_TIMEOUT_SECONDS = int(os.getenv("GREENHOUSE_DISCOVERY_HTTP_TIMEOUT", "20"))
-MAX_FETCH_BYTES = int(os.getenv("GREENHOUSE_DISCOVERY_MAX_FETCH_BYTES", "200000"))
-VALIDATE_TOKENS = os.getenv("GREENHOUSE_DISCOVERY_VALIDATE", "true").strip().lower() in {
-    "1",
-    "true",
-    "yes",
-    "on",
-}
-SUMMARY_FILE = os.getenv("GREENHOUSE_DISCOVERY_SUMMARY_FILE", "greenhouse_discovery_summary.json")
+def _env_or_default(name: str, default: str) -> str:
+    value = os.getenv(name, "")
+    value = value.strip() if value is not None else ""
+    return value if value else default
+
+
+def _parse_bool_env(name: str, default: bool) -> bool:
+    raw = os.getenv(name, "")
+    raw = raw.strip().lower() if raw is not None else ""
+    if not raw:
+        return default
+    return raw in {"1", "true", "yes", "on"}
+
+
+def _parse_int_env(name: str, default: int, minimum: int = 1) -> int:
+    raw = os.getenv(name, "")
+    raw = raw.strip() if raw is not None else ""
+    if not raw:
+        return default
+    try:
+        parsed = int(raw)
+        return parsed if parsed >= minimum else default
+    except ValueError:
+        return default
+
+
+SHEET_ID = _env_or_default("SHEET_ID", "")
+CREDS_FILE = _env_or_default("CREDS_FILE", "service_account.json")
+JOBS_WORKSHEET_NAME = _env_or_default("JOBS_WORKSHEET_NAME", "Jobs")
+TOKENS_WORKSHEET_NAME = _env_or_default("GREENHOUSE_TOKENS_WORKSHEET", "GreenhouseTokens")
+DISCOVERY_ENABLED = _parse_bool_env("GREENHOUSE_DISCOVERY_ENABLED", True)
+MAX_URLS_TO_SCAN = _parse_int_env("GREENHOUSE_DISCOVERY_MAX_URLS", 400, minimum=1)
+HTTP_TIMEOUT_SECONDS = _parse_int_env("GREENHOUSE_DISCOVERY_HTTP_TIMEOUT", 20, minimum=1)
+MAX_FETCH_BYTES = _parse_int_env("GREENHOUSE_DISCOVERY_MAX_FETCH_BYTES", 200000, minimum=50000)
+VALIDATE_TOKENS = _parse_bool_env("GREENHOUSE_DISCOVERY_VALIDATE", True)
+SUMMARY_FILE = _env_or_default("GREENHOUSE_DISCOVERY_SUMMARY_FILE", "greenhouse_discovery_summary.json")
 
 HEADERS = [
     "Token",
@@ -40,12 +56,17 @@ HEADERS = [
     "First Seen Date",
     "Last Seen Date",
     "Last Checked Date",
+    "Board URL",
+    "Greenhouse URLs",
     "Source URLs",
     "Notes",
 ]
 
 TOKEN_REGEX = re.compile(r"https?://(?:job-boards|boards)\.greenhouse\.io/([a-z0-9-]+)", re.IGNORECASE)
-GREENHOUSE_LINK_REGEX = re.compile(r"https?://(?:job-boards|boards)\.greenhouse\.io/[a-z0-9-]+", re.IGNORECASE)
+GREENHOUSE_LINK_REGEX = re.compile(
+    r"https?://(?:job-boards|boards)\.greenhouse\.io/[a-z0-9-]+(?:/[^\s\"'<>)]*)?",
+    re.IGNORECASE,
+)
 HTTP_USER_AGENT = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
     "AppleWebKit/537.36 (KHTML, like Gecko) "
@@ -91,7 +112,7 @@ def ensure_headers(worksheet) -> None:
         worksheet.append_row(HEADERS, value_input_option="RAW")
         return
     if existing[0][: len(HEADERS)] != HEADERS:
-        worksheet.update(range_name="A1:G1", values=[HEADERS], value_input_option="RAW")
+        worksheet.update(range_name="A1:I1", values=[HEADERS], value_input_option="RAW")
 
 
 def get_or_create_worksheet(spreadsheet, worksheet_name: str):
@@ -116,6 +137,17 @@ def extract_tokens_from_text(value: str) -> Set[str]:
     return {match.group(1).lower() for match in TOKEN_REGEX.finditer(value or "")}
 
 
+def extract_greenhouse_urls_from_text(value: str) -> Set[str]:
+    urls = set()
+    for match in GREENHOUSE_LINK_REGEX.finditer(value or ""):
+        urls.add(match.group(0).strip())
+    return urls
+
+
+def canonical_board_url(token: str) -> str:
+    return f"https://boards.greenhouse.io/{token}"
+
+
 def fetch_url_context(url: str) -> Tuple[str, str]:
     request = urllib.request.Request(url, headers={"User-Agent": HTTP_USER_AGENT})
     with urllib.request.urlopen(request, timeout=HTTP_TIMEOUT_SECONDS) as response:
@@ -128,32 +160,60 @@ def fetch_url_context(url: str) -> Tuple[str, str]:
     return final_url, body
 
 
-def discover_tokens_from_urls(job_urls: List[str]) -> Dict[str, Set[str]]:
-    tokens_to_sources: Dict[str, Set[str]] = {}
+def discover_tokens_from_urls(job_urls: List[str]) -> Tuple[Dict[str, Dict[str, Set[str]]], int]:
+    token_map: Dict[str, Dict[str, Set[str]]] = {}
     scanned = 0
     fetch_failures = 0
 
     for url in job_urls:
         scanned += 1
         direct_tokens = extract_tokens_from_text(url)
+        direct_greenhouse_urls = extract_greenhouse_urls_from_text(url)
+
         for token in direct_tokens:
-            tokens_to_sources.setdefault(token, set()).add(url)
+            token_entry = token_map.setdefault(
+                token, {"source_urls": set(), "greenhouse_urls": set()}
+            )
+            token_entry["source_urls"].add(url)
+            token_entry["greenhouse_urls"].add(canonical_board_url(token))
+
+        for gh_url in direct_greenhouse_urls:
+            for token in extract_tokens_from_text(gh_url):
+                token_entry = token_map.setdefault(
+                    token, {"source_urls": set(), "greenhouse_urls": set()}
+                )
+                token_entry["source_urls"].add(url)
+                token_entry["greenhouse_urls"].add(gh_url)
 
         try:
             final_url, html_body = fetch_url_context(url)
-            all_text = " ".join([final_url, " ".join(GREENHOUSE_LINK_REGEX.findall(html_body))])
-            discovered_tokens = extract_tokens_from_text(all_text)
+            discovered_greenhouse_urls = set()
+            discovered_greenhouse_urls |= extract_greenhouse_urls_from_text(final_url)
+            discovered_greenhouse_urls |= extract_greenhouse_urls_from_text(html_body)
+
+            discovered_tokens = extract_tokens_from_text(final_url + "\n" + html_body)
             for token in discovered_tokens:
-                tokens_to_sources.setdefault(token, set()).add(url)
+                token_entry = token_map.setdefault(
+                    token, {"source_urls": set(), "greenhouse_urls": set()}
+                )
+                token_entry["source_urls"].add(url)
+                token_entry["greenhouse_urls"].add(canonical_board_url(token))
+            for gh_url in discovered_greenhouse_urls:
+                for token in extract_tokens_from_text(gh_url):
+                    token_entry = token_map.setdefault(
+                        token, {"source_urls": set(), "greenhouse_urls": set()}
+                    )
+                    token_entry["source_urls"].add(url)
+                    token_entry["greenhouse_urls"].add(gh_url)
         except Exception:
             fetch_failures += 1
             continue
 
     log(
-        f"Scanned {scanned} URLs, discovered {len(tokens_to_sources)} unique Greenhouse token candidates, "
+        f"Scanned {scanned} URLs, discovered {len(token_map)} unique Greenhouse token candidates, "
         f"fetch failures: {fetch_failures}"
     )
-    return tokens_to_sources
+    return token_map, fetch_failures
 
 
 def validate_token(token: str) -> bool:
@@ -180,7 +240,7 @@ def load_existing_tokens(worksheet) -> Dict[str, Tuple[int, List[str]]]:
     return result
 
 
-def merge_source_urls(existing_urls: str, discovered_sources: Set[str]) -> str:
+def merge_values(existing_urls: str, discovered_sources: Set[str]) -> str:
     items = [part.strip() for part in existing_urls.split(" | ") if part.strip()]
     existing = {item.lower() for item in items}
     for source in sorted(discovered_sources):
@@ -201,6 +261,7 @@ def main() -> None:
         "new_tokens_added": 0,
         "existing_tokens_updated": 0,
         "validation_failures": 0,
+        "fetch_failures": 0,
         "error": "",
     }
 
@@ -219,15 +280,16 @@ def main() -> None:
 
         job_urls = get_job_urls(jobs_ws, MAX_URLS_TO_SCAN)
         summary["urls_scanned"] = len(job_urls)
-        tokens_to_sources = discover_tokens_from_urls(job_urls)
-        summary["candidate_tokens"] = len(tokens_to_sources)
+        token_map, fetch_failures = discover_tokens_from_urls(job_urls)
+        summary["candidate_tokens"] = len(token_map)
+        summary["fetch_failures"] = fetch_failures
 
         existing_tokens = load_existing_tokens(tokens_ws)
         today = date.today().isoformat()
         row_updates = []
         rows_to_append = []
 
-        for token in sorted(tokens_to_sources.keys()):
+        for token in sorted(token_map.keys()):
             is_valid = validate_token(token) if VALIDATE_TOKENS else True
             if is_valid:
                 summary["validated_tokens"] += 1
@@ -235,22 +297,39 @@ def main() -> None:
                 summary["validation_failures"] += 1
 
             status = "active" if is_valid else "invalid"
-            source_urls = merge_source_urls("", tokens_to_sources[token])
+            source_urls = merge_values("", token_map[token]["source_urls"])
+            greenhouse_urls = merge_values("", token_map[token]["greenhouse_urls"])
+            board_url = canonical_board_url(token)
             notes = ""
 
             if token in existing_tokens:
                 row_number, existing_row = existing_tokens[token]
                 first_seen = existing_row[2].strip() or today
-                merged_sources = merge_source_urls(existing_row[5], tokens_to_sources[token])
+                merged_greenhouse_urls = merge_values(existing_row[6], token_map[token]["greenhouse_urls"])
+                merged_sources = merge_values(existing_row[7], token_map[token]["source_urls"])
                 row_updates.append(
                     {
-                        "range": f"A{row_number}:G{row_number}",
-                        "values": [[token, status, first_seen, today, today, merged_sources, notes]],
+                        "range": f"A{row_number}:I{row_number}",
+                        "values": [
+                            [
+                                token,
+                                status,
+                                first_seen,
+                                today,
+                                today,
+                                board_url,
+                                merged_greenhouse_urls,
+                                merged_sources,
+                                notes,
+                            ]
+                        ],
                     }
                 )
                 summary["existing_tokens_updated"] += 1
             else:
-                rows_to_append.append([token, status, today, today, today, source_urls, notes])
+                rows_to_append.append(
+                    [token, status, today, today, today, board_url, greenhouse_urls, source_urls, notes]
+                )
                 summary["new_tokens_added"] += 1
 
         if row_updates:

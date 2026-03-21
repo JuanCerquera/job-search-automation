@@ -9,7 +9,7 @@ from datetime import date, datetime, timedelta, timezone
 from functools import lru_cache
 from pathlib import Path
 from typing import Dict, List, Tuple, Any
-from urllib.parse import parse_qs, quote_plus, unquote, urljoin, urlparse
+from urllib.parse import quote_plus
 
 import gspread
 from google.auth.transport.requests import Request
@@ -112,15 +112,8 @@ HEADERS = [
     "Company",
     "Location",
     "Date Posted",
-    "Apply URL",
     "Keyword",
     "Date Added",
-]
-APPLY_LINK_SELECTORS = [
-    "a[data-tracking-control-name='public_jobs_topcard-apply']",
-    "a.top-card-layout__cta--primary",
-    "a.topcard__link",
-    "a[href*='linkedin.com/jobs/view/'][href*='apply']",
 ]
 JOB_CARD_SELECTOR = "li:has(a.base-card__full-link)"
 NO_RESULTS_SELECTOR = (
@@ -323,50 +316,6 @@ def _title_matches_term_filters(title: str) -> bool:
     if expression_ast is None:
         return True
     return _evaluate_filter_ast(expression_ast, title_lower, title_compact)
-
-
-def _normalize_apply_url(apply_href: str, job_url: str) -> str:
-    cleaned_href = apply_href.strip()
-    if not cleaned_href or cleaned_href.startswith("javascript:") or cleaned_href == "#":
-        return job_url
-
-    absolute_url = urljoin(job_url, cleaned_href)
-    parsed = urlparse(absolute_url)
-    query = parse_qs(parsed.query)
-
-    # LinkedIn sometimes wraps outbound links in query parameters.
-    for key in ("url", "redirect", "redirectUrl", "target"):
-        if key in query and query[key]:
-            return unquote(query[key][0]).strip()
-
-    return absolute_url
-
-
-def resolve_apply_url(detail_page, job_url: str) -> str:
-    try:
-        run_with_heartbeat(
-            action=f"resolving apply URL for job {job_url}",
-            func=detail_page.goto,
-            url=job_url,
-            wait_until="domcontentloaded",
-            timeout=45000,
-        )
-    except PlaywrightTimeoutError:
-        log(f"Timed out opening job detail page for apply URL: {job_url}")
-        return job_url
-
-    for selector in APPLY_LINK_SELECTORS:
-        link = detail_page.locator(selector).first
-        try:
-            if link.count() == 0:
-                continue
-            href = link.get_attribute("href", timeout=1500)
-            if href:
-                return _normalize_apply_url(href, job_url)
-        except Exception:
-            continue
-
-    return job_url
 
 
 def _parse_posted_datetime(posted_value: str, now_utc: datetime) -> datetime | None:
@@ -660,7 +609,7 @@ def ensure_headers(worksheet) -> None:
 
     first_row = existing_values[0]
     if first_row[: len(HEADERS)] != HEADERS:
-        worksheet.update(range_name="A1:I1", values=[HEADERS], value_input_option="RAW")
+        worksheet.update(range_name="A1:H1", values=[HEADERS], value_input_option="RAW")
         log(f"Header row updated for tab '{worksheet.title}'.")
 
 
@@ -710,7 +659,7 @@ def write_rows_to_next_empty_range(worksheet, rows: List[List[str]]) -> None:
             f"to fit write range ending at row {end_row}."
         )
 
-    range_name = f"A{start_row}:I{end_row}"
+    range_name = f"A{start_row}:H{end_row}"
     worksheet.update(range_name=range_name, values=rows, value_input_option="RAW")
     log(f"Wrote {len(rows)} rows to range {range_name} in tab '{worksheet.title}'.")
 
@@ -790,7 +739,6 @@ def main() -> None:
                 viewport={"width": 1366, "height": 768},
             )
             page = context.new_page()
-            detail_page = context.new_page()
 
             for idx, keyword in enumerate(KEYWORDS):
                 log(f"Starting keyword {idx + 1}/{len(KEYWORDS)}: {keyword}")
@@ -806,7 +754,6 @@ def main() -> None:
                         continue
 
                     existing_urls.add(job_url)
-                    apply_url = resolve_apply_url(detail_page, job_url)
                     keyword_rows_to_append.append(
                         [
                             job_url,
@@ -815,7 +762,6 @@ def main() -> None:
                             job["company"],
                             job["location"],
                             job["date_posted"],
-                            apply_url,
                             keyword,
                             date_added,
                         ]

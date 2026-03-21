@@ -115,6 +115,12 @@ HEADERS = [
     "Date Posted",
     "Keyword",
     "Date Added",
+    "Source",
+    "Source Job ID",
+    "Canonical Key",
+    "Seen On",
+    "First Seen Date",
+    "Last Seen Date",
 ]
 JOB_CARD_SELECTOR = "li:has(a.base-card__full-link)"
 NO_RESULTS_SELECTOR = (
@@ -195,6 +201,23 @@ def _extract_linkedin_job_id(job_url: str) -> str:
     # Supports URLs like /jobs/view/<slug>-1234567890 and /jobs/view/1234567890
     match = re.search(r"/jobs/view/(?:[^/?#]*-)?(\d+)", job_url)
     return match.group(1) if match else ""
+
+
+def _column_letter(column_index_1_based: int) -> str:
+    result = ""
+    value = column_index_1_based
+    while value > 0:
+        value, remainder = divmod(value - 1, 26)
+        result = chr(65 + remainder) + result
+    return result
+
+
+def _join_sources(existing_seen_on: str, new_source: str) -> str:
+    existing_parts = [part.strip() for part in existing_seen_on.split(",") if part.strip()]
+    existing_set = {part.lower() for part in existing_parts}
+    if new_source and new_source.lower() not in existing_set:
+        existing_parts.append(new_source)
+    return ", ".join(existing_parts)
 
 
 def _normalized_text_for_term_matching(value: str) -> str:
@@ -631,51 +654,116 @@ def ensure_headers(worksheet) -> None:
 
     first_row = existing_values[0]
     if first_row[: len(HEADERS)] != HEADERS:
-        worksheet.update(range_name="A1:H1", values=[HEADERS], value_input_option="RAW")
+        last_col = _column_letter(len(HEADERS))
+        worksheet.update(range_name=f"A1:{last_col}1", values=[HEADERS], value_input_option="RAW")
         log(f"Header row updated for tab '{worksheet.title}'.")
 
 
-def get_existing_job_urls(worksheet) -> set[str]:
-    log(f"Loading existing rows from tab '{worksheet.title}' for deduplication.")
+def _normalize_existing_row_for_schema(row: List[str]) -> List[str]:
+    normalized = list(row[: len(HEADERS)]) + [""] * max(0, len(HEADERS) - len(row))
+
+    # Backward compatibility for historical layouts:
+    # - current schema keeps Job URL in column A
+    # - some older rows may still have it in column E
+    if not normalized[0].strip() and len(row) >= 5 and "/jobs/view/" in row[4]:
+        normalized[0] = row[4].strip()
+
+    normalized[0] = _normalize_job_url(normalized[0]) if normalized[0].strip() else ""
+    normalized[8] = normalized[8].strip() or SOURCE_NAME
+    normalized[9] = normalized[9].strip() or _extract_linkedin_job_id(normalized[0])
+
+    canonical_key = normalized[10].strip()
+    if not canonical_key:
+        canonical_key = _build_canonical_key(normalized[2], normalized[3], normalized[4])
+    normalized[10] = canonical_key
+
+    normalized[11] = _join_sources(normalized[11], normalized[8])
+    normalized[12] = normalized[12].strip() or normalized[7].strip()
+    normalized[13] = normalized[13].strip() or normalized[12].strip() or normalized[7].strip()
+
+    return normalized
+
+
+def _join_unique_values(existing_value: str, new_value: str, separator: str = " | ") -> str:
+    existing_parts = [part.strip() for part in existing_value.split(separator) if part.strip()]
+    existing_set = {part.lower() for part in existing_parts}
+    clean_new = new_value.strip()
+    if clean_new and clean_new.lower() not in existing_set:
+        existing_parts.append(clean_new)
+    return separator.join(existing_parts)
+
+
+def load_existing_row_index(worksheet):
+    log(f"Loading existing rows from tab '{worksheet.title}' for deduplication and merge indexing.")
     rows = worksheet.get_all_values()
-    existing_urls = set()
+    rows_by_number: Dict[int, List[str]] = {}
+    by_job_url: Dict[str, int] = {}
+    by_canonical_key: Dict[str, int] = {}
 
-    def extract_job_url_from_row(row: List[str]) -> str:
-        # Current layout keeps Job URL in column A. Fall back to legacy column E
-        # so dedupe still works for rows written before the column reorder.
-        candidates = []
-        if row:
-            candidates.append(row[0].strip())
-        if len(row) >= 5:
-            candidates.append(row[4].strip())
-        for candidate in candidates:
-            if "/jobs/view/" in candidate:
-                return candidate
-        return ""
+    for row_number, raw_row in enumerate(rows[1:], start=2):
+        normalized_row = _normalize_existing_row_for_schema(raw_row)
+        rows_by_number[row_number] = normalized_row
 
-    for row in rows[1:]:
-        extracted_job_url = extract_job_url_from_row(row)
-        if extracted_job_url:
-            existing_urls.add(_normalize_job_url(extracted_job_url))
-    log(f"Loaded {len(existing_urls)} existing URLs from tab '{worksheet.title}'")
-    return existing_urls
+        job_url = normalized_row[0].strip()
+        if job_url and job_url not in by_job_url:
+            by_job_url[job_url] = row_number
+
+        canonical_key = normalized_row[10].strip()
+        if canonical_key and canonical_key != "||" and canonical_key not in by_canonical_key:
+            by_canonical_key[canonical_key] = row_number
+
+    log(
+        f"Loaded {len(rows_by_number)} existing rows, "
+        f"{len(by_job_url)} URL keys, {len(by_canonical_key)} canonical keys."
+    )
+    return rows_by_number, by_job_url, by_canonical_key
 
 
-def get_existing_canonical_keys(worksheet) -> set[str]:
-    rows = worksheet.get_all_values()
-    canonical_keys = set()
-    for row in rows[1:]:
-        if len(row) < 5:
-            continue
-        # Current schema: Job URL, Application Date, Job Title, Company, Location, ...
-        title = row[2].strip()
-        company = row[3].strip()
-        location = row[4].strip()
-        canonical_key = _build_canonical_key(title, company, location)
-        if canonical_key != "||":
-            canonical_keys.add(canonical_key)
-    log(f"Loaded {len(canonical_keys)} canonical keys from tab '{worksheet.title}'")
-    return canonical_keys
+def merge_job_into_existing_row(existing_row: List[str], job: Dict[str, str], keyword: str, today: str) -> List[str]:
+    row = list(existing_row[: len(HEADERS)]) + [""] * max(0, len(HEADERS) - len(existing_row))
+
+    if not row[0].strip():
+        row[0] = job["job_url"]
+    if not row[2].strip():
+        row[2] = job["title"]
+    if not row[3].strip():
+        row[3] = job["company"]
+    if not row[4].strip():
+        row[4] = job["location"]
+    if not row[5].strip():
+        row[5] = job["date_posted"]
+
+    row[6] = _join_unique_values(row[6], keyword)
+    row[7] = row[7].strip() or today
+    row[8] = row[8].strip() or job.get("source", SOURCE_NAME)
+    row[9] = row[9].strip() or job.get("source_job_id", "")
+    row[10] = row[10].strip() or job.get("canonical_key", "")
+    row[11] = _join_sources(row[11], job.get("source", SOURCE_NAME))
+    row[12] = row[12].strip() or row[7]
+    row[13] = today
+
+    return row
+
+
+def write_row_updates(worksheet, row_updates: Dict[int, List[str]]) -> None:
+    if not row_updates:
+        return
+
+    last_col = _column_letter(len(HEADERS))
+    data = []
+    for row_number in sorted(row_updates.keys()):
+        normalized_row = row_updates[row_number][: len(HEADERS)] + [""] * max(
+            0, len(HEADERS) - len(row_updates[row_number])
+        )
+        data.append(
+            {
+                "range": f"A{row_number}:{last_col}{row_number}",
+                "values": [normalized_row],
+            }
+        )
+
+    worksheet.batch_update(data, value_input_option="RAW")
+    log(f"Updated {len(data)} existing rows in tab '{worksheet.title}'.")
 
 
 def get_next_empty_row(worksheet) -> int:
@@ -698,7 +786,8 @@ def write_rows_to_next_empty_range(worksheet, rows: List[List[str]]) -> None:
             f"to fit write range ending at row {end_row}."
         )
 
-    range_name = f"A{start_row}:H{end_row}"
+    last_col = _column_letter(len(HEADERS))
+    range_name = f"A{start_row}:{last_col}{end_row}"
     worksheet.update(range_name=range_name, values=rows, value_input_option="RAW")
     log(f"Wrote {len(rows)} rows to range {range_name} in tab '{worksheet.title}'.")
 
@@ -706,7 +795,7 @@ def write_rows_to_next_empty_range(worksheet, rows: List[List[str]]) -> None:
 def main() -> None:
     started_at = datetime.utcnow()
     summary: Dict[str, Any] = {
-        "phase": "phase1_source_aware_report_only",
+        "phase": "phase2_merge_writes",
         "status": "running",
         "started_at_utc": started_at.isoformat() + "Z",
         "finished_at_utc": "",
@@ -728,6 +817,9 @@ def main() -> None:
             "rows_collected_before_dedupe": 0,
             "new_rows_appended": 0,
             "duplicates_skipped": 0,
+            "merged_existing_rows": 0,
+            "merged_by_job_url": 0,
+            "merged_by_canonical_key": 0,
             "canonical_duplicates_in_run": 0,
             "canonical_duplicates_against_existing": 0,
             "skipped_old": 0,
@@ -765,16 +857,20 @@ def main() -> None:
         spreadsheet = get_spreadsheet(client)
         worksheet = get_jobs_worksheet(spreadsheet)
         ensure_headers(worksheet)
-        existing_urls = get_existing_job_urls(worksheet)
-        existing_canonical_keys = get_existing_canonical_keys(worksheet)
+        rows_by_number, by_job_url, by_canonical_key = load_existing_row_index(worksheet)
         date_added = date.today().isoformat()
         now_utc = datetime.utcnow()
 
         total_new_rows = 0
         total_duplicates_skipped = 0
+        total_merged_existing_rows = 0
+        total_merged_by_job_url = 0
+        total_merged_by_canonical = 0
         total_canonical_dupes_in_run = 0
         total_canonical_dupes_against_existing = 0
         run_seen_canonical_keys = set()
+        staged_new_job_urls = set()
+        staged_new_canonical_keys = set()
 
         with sync_playwright() as playwright:
             log("Launching Playwright Chromium in headless mode.")
@@ -792,8 +888,12 @@ def main() -> None:
                 keyword_jobs, keyword_stats = scrape_keyword_jobs(page, keyword, now_utc)
                 keyword_rows_to_append: List[List[str]] = []
                 keyword_duplicates_skipped = 0
+                keyword_merged_existing_rows = 0
+                keyword_merged_by_job_url = 0
+                keyword_merged_by_canonical = 0
                 keyword_canonical_dupes_in_run = 0
                 keyword_canonical_dupes_against_existing = 0
+                keyword_row_updates: Dict[int, List[str]] = {}
 
                 for job in keyword_jobs:
                     job_url = job["job_url"]
@@ -805,26 +905,61 @@ def main() -> None:
                         else:
                             run_seen_canonical_keys.add(canonical_key)
 
-                        if canonical_key in existing_canonical_keys:
+                        if canonical_key in by_canonical_key:
                             keyword_canonical_dupes_against_existing += 1
 
-                    if job_url in existing_urls:
+                    # Deduplicate against rows staged for append in this run.
+                    if job_url in staged_new_job_urls:
+                        keyword_duplicates_skipped += 1
+                        continue
+                    if canonical_key and canonical_key in staged_new_canonical_keys:
                         keyword_duplicates_skipped += 1
                         continue
 
-                    existing_urls.add(job_url)
-                    keyword_rows_to_append.append(
-                        [
-                            job_url,
-                            "",
-                            job["title"],
-                            job["company"],
-                            job["location"],
-                            job["date_posted"],
-                            keyword,
-                            date_added,
-                        ]
-                    )
+                    matched_row_number = None
+                    if job_url in by_job_url:
+                        matched_row_number = by_job_url[job_url]
+                        keyword_merged_by_job_url += 1
+                    elif canonical_key and canonical_key in by_canonical_key:
+                        matched_row_number = by_canonical_key[canonical_key]
+                        keyword_merged_by_canonical += 1
+
+                    if matched_row_number is not None:
+                        keyword_duplicates_skipped += 1
+                        keyword_merged_existing_rows += 1
+                        existing_row = rows_by_number.get(matched_row_number, [""] * len(HEADERS))
+                        merged_row = merge_job_into_existing_row(existing_row, job, keyword, date_added)
+                        rows_by_number[matched_row_number] = merged_row
+                        keyword_row_updates[matched_row_number] = merged_row
+                        by_job_url[job_url] = matched_row_number
+                        canonical_after_merge = merged_row[10].strip()
+                        if canonical_after_merge and canonical_after_merge not in by_canonical_key:
+                            by_canonical_key[canonical_after_merge] = matched_row_number
+                        continue
+
+                    new_row = [
+                        job_url,
+                        "",
+                        job["title"],
+                        job["company"],
+                        job["location"],
+                        job["date_posted"],
+                        keyword,
+                        date_added,
+                        job.get("source", SOURCE_NAME),
+                        job.get("source_job_id", ""),
+                        canonical_key,
+                        job.get("source", SOURCE_NAME),
+                        date_added,
+                        date_added,
+                    ]
+                    keyword_rows_to_append.append(new_row)
+                    staged_new_job_urls.add(job_url)
+                    if canonical_key:
+                        staged_new_canonical_keys.add(canonical_key)
+
+                if keyword_row_updates:
+                    write_row_updates(worksheet, keyword_row_updates)
 
                 if keyword_rows_to_append:
                     log(
@@ -838,6 +973,9 @@ def main() -> None:
 
                 total_new_rows += len(keyword_rows_to_append)
                 total_duplicates_skipped += keyword_duplicates_skipped
+                total_merged_existing_rows += keyword_merged_existing_rows
+                total_merged_by_job_url += keyword_merged_by_job_url
+                total_merged_by_canonical += keyword_merged_by_canonical
                 total_canonical_dupes_in_run += keyword_canonical_dupes_in_run
                 total_canonical_dupes_against_existing += keyword_canonical_dupes_against_existing
                 summary["keywords"].append(
@@ -845,6 +983,9 @@ def main() -> None:
                         **keyword_stats,
                         "new_rows_appended": len(keyword_rows_to_append),
                         "duplicates_skipped": keyword_duplicates_skipped,
+                        "merged_existing_rows": keyword_merged_existing_rows,
+                        "merged_by_job_url": keyword_merged_by_job_url,
+                        "merged_by_canonical_key": keyword_merged_by_canonical,
                         "canonical_duplicates_in_run": keyword_canonical_dupes_in_run,
                         "canonical_duplicates_against_existing": keyword_canonical_dupes_against_existing,
                     }
@@ -854,6 +995,8 @@ def main() -> None:
                 log(
                     f"Keyword complete: {keyword}. New rows: {len(keyword_rows_to_append)}. "
                     f"Duplicates skipped: {keyword_duplicates_skipped}. "
+                    f"Merged existing rows: {keyword_merged_existing_rows} "
+                    f"(url={keyword_merged_by_job_url}, canonical={keyword_merged_by_canonical}). "
                     f"Canonical dupes in run: {keyword_canonical_dupes_in_run}. "
                     f"Canonical dupes vs existing: {keyword_canonical_dupes_against_existing}"
                 )
@@ -869,6 +1012,9 @@ def main() -> None:
             "rows_collected_before_dedupe": sum(int(item["rows_collected"]) for item in summary["keywords"]),
             "new_rows_appended": total_new_rows,
             "duplicates_skipped": total_duplicates_skipped,
+            "merged_existing_rows": total_merged_existing_rows,
+            "merged_by_job_url": total_merged_by_job_url,
+            "merged_by_canonical_key": total_merged_by_canonical,
             "canonical_duplicates_in_run": total_canonical_dupes_in_run,
             "canonical_duplicates_against_existing": total_canonical_dupes_against_existing,
             "skipped_old": sum(int(item["skipped_old"]) for item in summary["keywords"]),
@@ -883,6 +1029,8 @@ def main() -> None:
         log(
             f"Scraper finished. Total new rows: {total_new_rows}. "
             f"Total duplicates skipped: {total_duplicates_skipped}. "
+            f"Merged existing rows: {total_merged_existing_rows} "
+            f"(url={total_merged_by_job_url}, canonical={total_merged_by_canonical}). "
             f"Canonical dupes in run: {total_canonical_dupes_in_run}. "
             f"Canonical dupes vs existing: {total_canonical_dupes_against_existing}"
         )

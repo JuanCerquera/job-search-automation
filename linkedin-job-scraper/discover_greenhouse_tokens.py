@@ -49,6 +49,7 @@ HTTP_TIMEOUT_SECONDS = _parse_int_env("GREENHOUSE_DISCOVERY_HTTP_TIMEOUT", 20, m
 MAX_FETCH_BYTES = _parse_int_env("GREENHOUSE_DISCOVERY_MAX_FETCH_BYTES", 200000, minimum=50000)
 VALIDATE_TOKENS = _parse_bool_env("GREENHOUSE_DISCOVERY_VALIDATE", True)
 SUMMARY_FILE = _env_or_default("GREENHOUSE_DISCOVERY_SUMMARY_FILE", "greenhouse_discovery_summary.json")
+DEFAULT_TOKENS_WORKSHEET = "GreenhouseTokens"
 
 HEADERS = [
     "Token",
@@ -122,6 +123,23 @@ def get_or_create_worksheet(spreadsheet, worksheet_name: str):
         worksheet = spreadsheet.add_worksheet(title=worksheet_name, rows=2000, cols=10)
     ensure_headers(worksheet)
     return worksheet
+
+
+def safe_tokens_worksheet_name(jobs_worksheet_name: str, configured_tokens_worksheet_name: str) -> str:
+    jobs_name = (jobs_worksheet_name or "").strip()
+    tokens_name = (configured_tokens_worksheet_name or "").strip() or DEFAULT_TOKENS_WORKSHEET
+    if jobs_name.lower() != tokens_name.lower():
+        return tokens_name
+
+    # Hard safety guard: never let token discovery write into Jobs worksheet.
+    fallback = DEFAULT_TOKENS_WORKSHEET
+    if fallback.lower() == jobs_name.lower():
+        fallback = f"{DEFAULT_TOKENS_WORKSHEET}_Auto"
+    log(
+        "Safety override: GREENHOUSE_TOKENS_WORKSHEET matched JOBS_WORKSHEET_NAME. "
+        f"Using '{fallback}' for token discovery instead."
+    )
+    return fallback
 
 
 def get_job_urls(worksheet, max_urls: int) -> List[str]:
@@ -252,9 +270,12 @@ def merge_values(existing_urls: str, discovered_sources: Set[str]) -> str:
 
 
 def main() -> None:
+    tokens_worksheet_name = safe_tokens_worksheet_name(JOBS_WORKSHEET_NAME, TOKENS_WORKSHEET_NAME)
     summary = {
         "started_at_utc": datetime.utcnow().isoformat() + "Z",
         "status": "running",
+        "jobs_worksheet_name": JOBS_WORKSHEET_NAME,
+        "tokens_worksheet_name": tokens_worksheet_name,
         "urls_scanned": 0,
         "candidate_tokens": 0,
         "validated_tokens": 0,
@@ -276,7 +297,7 @@ def main() -> None:
         client = get_gspread_client()
         spreadsheet = client.open_by_key(SHEET_ID)
         jobs_ws = get_or_create_worksheet(spreadsheet, JOBS_WORKSHEET_NAME)
-        tokens_ws = get_or_create_worksheet(spreadsheet, TOKENS_WORKSHEET_NAME)
+        tokens_ws = get_or_create_worksheet(spreadsheet, tokens_worksheet_name)
 
         job_urls = get_job_urls(jobs_ws, MAX_URLS_TO_SCAN)
         summary["urls_scanned"] = len(job_urls)

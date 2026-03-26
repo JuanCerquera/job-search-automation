@@ -107,21 +107,22 @@ def get_gspread_client():
     return gspread.authorize(credentials)
 
 
-def ensure_headers(worksheet) -> None:
+def ensure_headers(worksheet, headers: List[str]) -> None:
     existing = worksheet.get_all_values()
     if not existing:
-        worksheet.append_row(HEADERS, value_input_option="RAW")
+        worksheet.append_row(headers, value_input_option="RAW")
         return
-    if existing[0][: len(HEADERS)] != HEADERS:
-        worksheet.update(range_name="A1:I1", values=[HEADERS], value_input_option="RAW")
+    if existing[0][: len(headers)] != headers:
+        end_col = chr(ord("A") + len(headers) - 1)
+        worksheet.update(range_name=f"A1:{end_col}1", values=[headers], value_input_option="RAW")
 
 
-def get_or_create_worksheet(spreadsheet, worksheet_name: str):
+def get_or_create_worksheet(spreadsheet, worksheet_name: str, headers: List[str]):
     try:
         worksheet = spreadsheet.worksheet(worksheet_name)
     except WorksheetNotFound:
         worksheet = spreadsheet.add_worksheet(title=worksheet_name, rows=2000, cols=10)
-    ensure_headers(worksheet)
+    ensure_headers(worksheet, headers)
     return worksheet
 
 
@@ -296,8 +297,8 @@ def main() -> None:
     try:
         client = get_gspread_client()
         spreadsheet = client.open_by_key(SHEET_ID)
-        jobs_ws = get_or_create_worksheet(spreadsheet, JOBS_WORKSHEET_NAME)
-        tokens_ws = get_or_create_worksheet(spreadsheet, tokens_worksheet_name)
+        jobs_ws = get_or_create_worksheet(spreadsheet, JOBS_WORKSHEET_NAME, headers=["Job URL"])
+        tokens_ws = get_or_create_worksheet(spreadsheet, tokens_worksheet_name, headers=HEADERS)
 
         job_urls = get_job_urls(jobs_ws, MAX_URLS_TO_SCAN)
         summary["urls_scanned"] = len(job_urls)

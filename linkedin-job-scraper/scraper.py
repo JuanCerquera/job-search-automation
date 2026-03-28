@@ -9,7 +9,7 @@ from datetime import date, datetime, timedelta, timezone
 from functools import lru_cache
 from pathlib import Path
 from typing import Any, Dict, List, Tuple
-from urllib.parse import quote_plus
+from urllib.parse import quote_plus, unquote, urlparse, urlunparse
 
 import gspread
 from google.auth.transport.requests import Request
@@ -182,7 +182,30 @@ def _build_search_url(keyword: str, start: int) -> str:
 
 
 def _normalize_job_url(url: str) -> str:
-    return url.split("?", 1)[0].rstrip("/")
+    raw = (url or "").strip()
+    if not raw:
+        return ""
+
+    # Collapse accidental whitespace that can appear from manual sheet edits.
+    raw = "".join(raw.split())
+
+    try:
+        parsed = urlparse(raw)
+        if not parsed.scheme and not parsed.netloc and parsed.path.startswith("/"):
+            # LinkedIn sometimes returns relative href values; normalize to absolute.
+            parsed = urlparse(f"https://www.linkedin.com{parsed.path}")
+
+        scheme = (parsed.scheme or "https").lower()
+        netloc = (parsed.netloc or "").lower()
+        path = unquote(parsed.path or "")
+        if path and not path.startswith("/"):
+            path = f"/{path}"
+        path = re.sub(r"/{2,}", "/", path).rstrip("/")
+
+        normalized = urlunparse((scheme, netloc, path, "", "", ""))
+        return normalized if normalized else raw.split("?", 1)[0].rstrip("/").strip()
+    except Exception:
+        return raw.split("?", 1)[0].rstrip("/").strip()
 
 
 def _normalize_for_fingerprint(value: str) -> str:
@@ -699,6 +722,7 @@ def load_existing_row_index(worksheet):
     rows = worksheet.get_all_values()
     rows_by_number: Dict[int, List[str]] = {}
     by_job_url: Dict[str, int] = {}
+    by_source_job_id: Dict[str, int] = {}
     by_canonical_key: Dict[str, int] = {}
 
     for row_number, raw_row in enumerate(rows[1:], start=2):
@@ -708,6 +732,9 @@ def load_existing_row_index(worksheet):
         job_url = normalized_row[0].strip()
         if job_url and job_url not in by_job_url:
             by_job_url[job_url] = row_number
+        source_job_id = normalized_row[9].strip()
+        if source_job_id and source_job_id not in by_source_job_id:
+            by_source_job_id[source_job_id] = row_number
 
         canonical_key = normalized_row[10].strip()
         if canonical_key and canonical_key != "||" and canonical_key not in by_canonical_key:
@@ -715,9 +742,10 @@ def load_existing_row_index(worksheet):
 
     log(
         f"Loaded {len(rows_by_number)} existing rows, "
-        f"{len(by_job_url)} URL keys, {len(by_canonical_key)} canonical keys."
+        f"{len(by_job_url)} URL keys, {len(by_source_job_id)} source-job-id keys, "
+        f"{len(by_canonical_key)} canonical keys."
     )
-    return rows_by_number, by_job_url, by_canonical_key
+    return rows_by_number, by_job_url, by_source_job_id, by_canonical_key
 
 
 def merge_job_into_existing_row(existing_row: List[str], job: Dict[str, str], keyword: str, today: str) -> List[str]:
@@ -774,6 +802,7 @@ def build_source_summary(keyword_summaries: List[Dict[str, Any]]) -> List[Dict[s
         "duplicates_skipped",
         "merged_existing_rows",
         "merged_by_job_url",
+        "merged_by_source_job_id",
         "merged_by_canonical_key",
         "canonical_duplicates_in_run",
         "canonical_duplicates_against_existing",
@@ -883,7 +912,7 @@ def main() -> None:
         spreadsheet = get_spreadsheet(client)
         worksheet = get_jobs_worksheet(spreadsheet)
         ensure_headers(worksheet)
-        rows_by_number, by_job_url, by_canonical_key = load_existing_row_index(worksheet)
+        rows_by_number, by_job_url, by_source_job_id, by_canonical_key = load_existing_row_index(worksheet)
         date_added = date.today().isoformat()
         now_utc = datetime.utcnow()
 
@@ -891,11 +920,13 @@ def main() -> None:
         total_duplicates_skipped = 0
         total_merged_existing_rows = 0
         total_merged_by_job_url = 0
+        total_merged_by_source_job_id = 0
         total_merged_by_canonical = 0
         total_canonical_dupes_in_run = 0
         total_canonical_dupes_against_existing = 0
         run_seen_canonical_keys = set()
         staged_new_job_urls = set()
+        staged_new_source_job_ids = set()
         staged_new_canonical_keys = set()
 
         with sync_playwright() as playwright:
@@ -915,6 +946,7 @@ def main() -> None:
                 batch_duplicates_skipped = 0
                 batch_merged_existing_rows = 0
                 batch_merged_by_job_url = 0
+                batch_merged_by_source_job_id = 0
                 batch_merged_by_canonical = 0
                 batch_canonical_dupes_in_run = 0
                 batch_canonical_dupes_against_existing = 0
@@ -922,6 +954,7 @@ def main() -> None:
 
                 for job in batch_jobs:
                     job_url = job["job_url"]
+                    source_job_id = (job.get("source_job_id") or _extract_linkedin_job_id(job_url)).strip()
                     canonical_key = job.get("canonical_key", "")
 
                     if canonical_key:
@@ -937,6 +970,9 @@ def main() -> None:
                     if job_url in staged_new_job_urls:
                         batch_duplicates_skipped += 1
                         continue
+                    if source_job_id and source_job_id in staged_new_source_job_ids:
+                        batch_duplicates_skipped += 1
+                        continue
                     if canonical_key and canonical_key in staged_new_canonical_keys:
                         batch_duplicates_skipped += 1
                         continue
@@ -945,6 +981,9 @@ def main() -> None:
                     if job_url in by_job_url:
                         matched_row_number = by_job_url[job_url]
                         batch_merged_by_job_url += 1
+                    elif source_job_id and source_job_id in by_source_job_id:
+                        matched_row_number = by_source_job_id[source_job_id]
+                        batch_merged_by_source_job_id += 1
                     elif canonical_key and canonical_key in by_canonical_key:
                         matched_row_number = by_canonical_key[canonical_key]
                         batch_merged_by_canonical += 1
@@ -957,6 +996,8 @@ def main() -> None:
                         rows_by_number[matched_row_number] = merged_row
                         batch_row_updates[matched_row_number] = merged_row
                         by_job_url[job_url] = matched_row_number
+                        if source_job_id:
+                            by_source_job_id[source_job_id] = matched_row_number
                         canonical_after_merge = merged_row[10].strip()
                         if canonical_after_merge and canonical_after_merge not in by_canonical_key:
                             by_canonical_key[canonical_after_merge] = matched_row_number
@@ -972,7 +1013,7 @@ def main() -> None:
                         keyword,
                         date_added,
                         SOURCE_NAME,
-                        job.get("source_job_id", ""),
+                        source_job_id,
                         canonical_key,
                         SOURCE_NAME,
                         date_added,
@@ -980,6 +1021,8 @@ def main() -> None:
                     ]
                     batch_rows_to_append.append(new_row)
                     staged_new_job_urls.add(job_url)
+                    if source_job_id:
+                        staged_new_source_job_ids.add(source_job_id)
                     if canonical_key:
                         staged_new_canonical_keys.add(canonical_key)
 
@@ -1000,6 +1043,7 @@ def main() -> None:
                 total_duplicates_skipped += batch_duplicates_skipped
                 total_merged_existing_rows += batch_merged_existing_rows
                 total_merged_by_job_url += batch_merged_by_job_url
+                total_merged_by_source_job_id += batch_merged_by_source_job_id
                 total_merged_by_canonical += batch_merged_by_canonical
                 total_canonical_dupes_in_run += batch_canonical_dupes_in_run
                 total_canonical_dupes_against_existing += batch_canonical_dupes_against_existing
@@ -1012,6 +1056,7 @@ def main() -> None:
                         "duplicates_skipped": batch_duplicates_skipped,
                         "merged_existing_rows": batch_merged_existing_rows,
                         "merged_by_job_url": batch_merged_by_job_url,
+                        "merged_by_source_job_id": batch_merged_by_source_job_id,
                         "merged_by_canonical_key": batch_merged_by_canonical,
                         "canonical_duplicates_in_run": batch_canonical_dupes_in_run,
                         "canonical_duplicates_against_existing": batch_canonical_dupes_against_existing,
@@ -1023,7 +1068,8 @@ def main() -> None:
                     f"Keyword complete: {keyword}. New rows: {len(batch_rows_to_append)}. "
                     f"Duplicates skipped: {batch_duplicates_skipped}. "
                     f"Merged existing rows: {batch_merged_existing_rows} "
-                    f"(url={batch_merged_by_job_url}, canonical={batch_merged_by_canonical}). "
+                    f"(url={batch_merged_by_job_url}, source_job_id={batch_merged_by_source_job_id}, "
+                    f"canonical={batch_merged_by_canonical}). "
                     f"Canonical dupes in run: {batch_canonical_dupes_in_run}. "
                     f"Canonical dupes vs existing: {batch_canonical_dupes_against_existing}"
                 )
@@ -1041,6 +1087,7 @@ def main() -> None:
             "duplicates_skipped": total_duplicates_skipped,
             "merged_existing_rows": total_merged_existing_rows,
             "merged_by_job_url": total_merged_by_job_url,
+            "merged_by_source_job_id": total_merged_by_source_job_id,
             "merged_by_canonical_key": total_merged_by_canonical,
             "canonical_duplicates_in_run": total_canonical_dupes_in_run,
             "canonical_duplicates_against_existing": total_canonical_dupes_against_existing,
@@ -1058,7 +1105,8 @@ def main() -> None:
             f"Scraper finished. Total new rows: {total_new_rows}. "
             f"Total duplicates skipped: {total_duplicates_skipped}. "
             f"Merged existing rows: {total_merged_existing_rows} "
-            f"(url={total_merged_by_job_url}, canonical={total_merged_by_canonical}). "
+            f"(url={total_merged_by_job_url}, source_job_id={total_merged_by_source_job_id}, "
+            f"canonical={total_merged_by_canonical}). "
             f"Canonical dupes in run: {total_canonical_dupes_in_run}. "
             f"Canonical dupes vs existing: {total_canonical_dupes_against_existing}"
         )

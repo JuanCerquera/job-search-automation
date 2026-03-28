@@ -842,6 +842,25 @@ def write_rows_to_next_empty_range(worksheet, rows: List[List[str]]) -> None:
     log(f"Wrote {len(rows)} rows to range {range_name} in tab '{worksheet.title}'.")
 
 
+def load_live_dedupe_sets(worksheet) -> tuple[set[str], set[str]]:
+    """Read current sheet state to avoid stale-index duplicate inserts."""
+    rows = worksheet.get_all_values()
+    seen_job_urls: set[str] = set()
+    seen_source_job_ids: set[str] = set()
+
+    for raw_row in rows[1:]:
+        normalized_row = _normalize_existing_row_for_schema(raw_row)
+        job_url = normalized_row[0].strip()
+        if job_url:
+            seen_job_urls.add(job_url)
+
+        source_job_id = normalized_row[9].strip()
+        if source_job_id:
+            seen_source_job_ids.add(source_job_id)
+
+    return seen_job_urls, seen_source_job_ids
+
+
 def main() -> None:
     started_at = datetime.utcnow()
     enabled_sources = [SOURCE_NAME]
@@ -1028,6 +1047,34 @@ def main() -> None:
 
                 if batch_row_updates:
                     write_row_updates(worksheet, batch_row_updates)
+
+                if batch_rows_to_append:
+                    # Final safety check against live sheet state to catch duplicates
+                    # that may appear if another run writes while this run is active.
+                    live_job_urls, live_source_job_ids = load_live_dedupe_sets(worksheet)
+                    filtered_rows_to_append: List[List[str]] = []
+                    dropped_by_live_dedupe = 0
+                    for row in batch_rows_to_append:
+                        row_job_url = row[0].strip()
+                        row_source_job_id = row[9].strip()
+                        if row_job_url in live_job_urls:
+                            dropped_by_live_dedupe += 1
+                            continue
+                        if row_source_job_id and row_source_job_id in live_source_job_ids:
+                            dropped_by_live_dedupe += 1
+                            continue
+                        filtered_rows_to_append.append(row)
+                        live_job_urls.add(row_job_url)
+                        if row_source_job_id:
+                            live_source_job_ids.add(row_source_job_id)
+
+                    if dropped_by_live_dedupe:
+                        batch_duplicates_skipped += dropped_by_live_dedupe
+                        log(
+                            f"Live dedupe removed {dropped_by_live_dedupe} already-existing rows "
+                            f"before append for keyword '{keyword}'."
+                        )
+                    batch_rows_to_append = filtered_rows_to_append
 
                 if batch_rows_to_append:
                     log(

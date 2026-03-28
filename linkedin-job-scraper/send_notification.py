@@ -9,9 +9,6 @@ from pathlib import Path
 from typing import Any, Dict, List
 
 RUN_SUMMARY_FILE = os.getenv("RUN_SUMMARY_FILE", "scraper_run_summary.json").strip()
-GREENHOUSE_DISCOVERY_SUMMARY_FILE = os.getenv(
-    "GREENHOUSE_DISCOVERY_SUMMARY_FILE", "greenhouse_discovery_summary.json"
-).strip()
 RUN_STATUS = os.getenv("RUN_STATUS", "").strip().lower()
 
 SMTP_HOST = os.getenv("SMTP_HOST", "").strip()
@@ -57,22 +54,6 @@ def _load_summary(path: str) -> Dict[str, Any]:
     return json.loads(summary_path.read_text(encoding="utf-8"))
 
 
-def _load_greenhouse_discovery_summary(path: str) -> Dict[str, Any]:
-    summary_path = Path(path)
-    if not summary_path.exists():
-        return {
-            "status": "not_run",
-            "urls_scanned": 0,
-            "candidate_tokens": 0,
-            "validated_tokens": 0,
-            "new_tokens_added": 0,
-            "existing_tokens_updated": 0,
-            "validation_failures": 0,
-            "error": "",
-        }
-    return json.loads(summary_path.read_text(encoding="utf-8"))
-
-
 def _run_url() -> str:
     server = os.getenv("GITHUB_SERVER_URL", "https://github.com").strip()
     repo = os.getenv("GITHUB_REPOSITORY", "").strip()
@@ -104,7 +85,7 @@ def _build_source_table_rows(run_summary: Dict[str, Any]) -> str:
     return "".join(rows) if rows else "<tr><td colspan='4'>No source summary available</td></tr>"
 
 
-def _build_html(run_summary: Dict[str, Any], discovery_summary: Dict[str, Any]) -> str:
+def _build_html(run_summary: Dict[str, Any]) -> str:
     totals = run_summary.get("totals", {}) or {}
     status = escape(str(run_summary.get("status", RUN_STATUS or "unknown")).upper())
     run_url = _run_url()
@@ -113,8 +94,6 @@ def _build_html(run_summary: Dict[str, Any], discovery_summary: Dict[str, Any]) 
     )
     error = run_summary.get("error", "")
     error_html = f"<p><b>Error:</b> {escape(str(error))}</p>" if error else ""
-    discovery_status = escape(str(discovery_summary.get("status", "unknown")).upper())
-
     return f"""
 <html>
   <body style="font-family: Arial, sans-serif; font-size: 13px; color: #222;">
@@ -141,31 +120,12 @@ def _build_html(run_summary: Dict[str, Any], discovery_summary: Dict[str, Any]) 
       </tr>
       {_build_source_table_rows(run_summary)}
     </table>
-    <h4 style="margin: 12px 0 6px 0;">Greenhouse token discovery</h4>
-    <table cellpadding="5" cellspacing="0" border="1" style="border-collapse: collapse; margin-bottom: 10px;">
-      <tr>
-        <th>Status</th>
-        <th>URLs Scanned</th>
-        <th>Candidate Tokens</th>
-        <th>Validated Tokens</th>
-        <th>New Tokens Added</th>
-        <th>Existing Tokens Updated</th>
-      </tr>
-      <tr>
-        <td>{discovery_status}</td>
-        <td>{int(discovery_summary.get("urls_scanned", 0))}</td>
-        <td>{int(discovery_summary.get("candidate_tokens", 0))}</td>
-        <td>{int(discovery_summary.get("validated_tokens", 0))}</td>
-        <td>{int(discovery_summary.get("new_tokens_added", 0))}</td>
-        <td>{int(discovery_summary.get("existing_tokens_updated", 0))}</td>
-      </tr>
-    </table>
   </body>
 </html>
 """.strip()
 
 
-def _build_text(run_summary: Dict[str, Any], discovery_summary: Dict[str, Any]) -> str:
+def _build_text(run_summary: Dict[str, Any]) -> str:
     totals = run_summary.get("totals", {}) or {}
     lines = [
         f"LinkedIn Job Scraper Run: {str(run_summary.get('status', RUN_STATUS or 'unknown')).upper()}",
@@ -194,21 +154,10 @@ def _build_text(run_summary: Dict[str, Any], discovery_summary: Dict[str, Any]) 
             f"new={int(item.get('new_rows_appended', 0))}, "
             f"merged={int(item.get('merged_existing_rows', 0))}"
         )
-
-    lines.append("")
-    lines.append("Greenhouse token discovery:")
-    lines.append(
-        f"- status={str(discovery_summary.get('status', 'unknown')).upper()}, "
-        f"urls_scanned={int(discovery_summary.get('urls_scanned', 0))}, "
-        f"candidate_tokens={int(discovery_summary.get('candidate_tokens', 0))}, "
-        f"validated_tokens={int(discovery_summary.get('validated_tokens', 0))}, "
-        f"new_tokens={int(discovery_summary.get('new_tokens_added', 0))}, "
-        f"updated_tokens={int(discovery_summary.get('existing_tokens_updated', 0))}"
-    )
     return "\n".join(lines)
 
 
-def _send_email(run_summary: Dict[str, Any], discovery_summary: Dict[str, Any]) -> None:
+def _send_email(run_summary: Dict[str, Any]) -> None:
     host = _required(SMTP_HOST, "SMTP_HOST")
     from_email = _required(SMTP_FROM_EMAIL, "SMTP_FROM_EMAIL")
     recipients = _to_recipients(_required(SMTP_TO_EMAIL, "SMTP_TO_EMAIL"))
@@ -221,8 +170,8 @@ def _send_email(run_summary: Dict[str, Any], discovery_summary: Dict[str, Any]) 
         raise ValueError(f"SMTP_PORT must be an integer, got '{SMTP_PORT}'") from exc
 
     subject = _build_subject(run_summary)
-    text_body = _build_text(run_summary, discovery_summary)
-    html_body = _build_html(run_summary, discovery_summary)
+    text_body = _build_text(run_summary)
+    html_body = _build_html(run_summary)
 
     message = MIMEMultipart("alternative")
     message["Subject"] = subject
@@ -250,8 +199,7 @@ def main() -> None:
     run_summary = _load_summary(RUN_SUMMARY_FILE)
     if run_summary.get("status") == "running":
         run_summary["status"] = RUN_STATUS or "unknown"
-    discovery_summary = _load_greenhouse_discovery_summary(GREENHOUSE_DISCOVERY_SUMMARY_FILE)
-    _send_email(run_summary, discovery_summary)
+    _send_email(run_summary)
     print(f"Notification email sent to: {SMTP_TO_EMAIL}", flush=True)
 
 

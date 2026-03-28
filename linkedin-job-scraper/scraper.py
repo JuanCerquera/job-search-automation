@@ -1,17 +1,15 @@
+import json
 import os
 import random
 import re
 import threading
 import time
-import json
 import traceback
-import urllib.error
-import urllib.request
 from datetime import date, datetime, timedelta, timezone
 from functools import lru_cache
 from pathlib import Path
-from typing import Dict, List, Tuple, Any
-from urllib.parse import parse_qs, quote, quote_plus, unquote, urljoin, urlparse
+from typing import Any, Dict, List, Tuple
+from urllib.parse import quote_plus
 
 import gspread
 from google.auth.transport.requests import Request
@@ -107,45 +105,6 @@ DEFAULT_KEYWORDS = [
 # "Keyword A|Keyword B|Keyword C"
 KEYWORDS_ENV = os.getenv("KEYWORDS", "").strip()
 KEYWORDS = [k.strip() for k in KEYWORDS_ENV.split("|") if k.strip()] if KEYWORDS_ENV else DEFAULT_KEYWORDS
-SUPPORTED_SOURCES = ["linkedin", "indeed", "ziprecruiter", "usajobs", "adzuna", "jooble"]
-
-USAJOBS_API_KEY = os.getenv("USAJOBS_API_KEY", "").strip()
-USAJOBS_USER_AGENT_EMAIL = os.getenv("USAJOBS_USER_AGENT_EMAIL", "").strip()
-USAJOBS_RESULTS_PER_PAGE = _parse_positive_int_env("USAJOBS_RESULTS_PER_PAGE", 25)
-USAJOBS_MAX_PAGES = _parse_positive_int_env("USAJOBS_MAX_PAGES", 2)
-
-ADZUNA_APP_ID = os.getenv("ADZUNA_APP_ID", "").strip()
-ADZUNA_APP_KEY = os.getenv("ADZUNA_APP_KEY", "").strip()
-ADZUNA_COUNTRY = os.getenv("ADZUNA_COUNTRY", "us").strip().lower() or "us"
-ADZUNA_RESULTS_PER_PAGE = _parse_positive_int_env("ADZUNA_RESULTS_PER_PAGE", 50)
-ADZUNA_MAX_PAGES = _parse_positive_int_env("ADZUNA_MAX_PAGES", 2)
-
-JOOBLE_API_KEY = os.getenv("JOOBLE_API_KEY", "").strip()
-JOOBLE_LOCATION = os.getenv("JOOBLE_LOCATION", "").strip()
-JOOBLE_MAX_PAGES = _parse_positive_int_env("JOOBLE_MAX_PAGES", 2)
-JOOBLE_BLOCKED_DOMAINS = [
-    item.strip().lower()
-    for item in os.getenv("JOOBLE_BLOCKED_DOMAINS", "jobleads.com,jobleads").replace(";", ",").split(",")
-    if item.strip()
-]
-JOOBLE_FILTER_REDIRECTS = os.getenv("JOOBLE_FILTER_REDIRECTS", "true").strip().lower() in {
-    "1",
-    "true",
-    "yes",
-    "on",
-}
-JOOBLE_REDIRECT_TIMEOUT_SECONDS = _parse_positive_int_env("JOOBLE_REDIRECT_TIMEOUT_SECONDS", 8)
-
-SCRAPE_LOCATION = os.getenv("SCRAPE_LOCATION", "United States").strip() or "United States"
-INDEED_ENABLED = os.getenv("INDEED_ENABLED", "true").strip().lower() in {"1", "true", "yes", "on"}
-INDEED_MAX_PAGES = _parse_positive_int_env("INDEED_MAX_PAGES", 1)
-ZIPRECRUITER_ENABLED = os.getenv("ZIPRECRUITER_ENABLED", "true").strip().lower() in {
-    "1",
-    "true",
-    "yes",
-    "on",
-}
-ZIPRECRUITER_MAX_PAGES = _parse_positive_int_env("ZIPRECRUITER_MAX_PAGES", 1)
 
 HEADERS = [
     "Job URL",
@@ -185,22 +144,6 @@ def write_run_summary(summary: Dict[str, Any]) -> None:
     summary_path.parent.mkdir(parents=True, exist_ok=True)
     summary_path.write_text(json.dumps(summary, indent=2), encoding="utf-8")
     log(f"Run summary written to {summary_path.as_posix()}")
-
-
-def http_get_json(url: str, headers: Dict[str, str] | None = None, timeout: int = 45):
-    request = urllib.request.Request(url, headers=headers or {})
-    with urllib.request.urlopen(request, timeout=timeout) as response:
-        return json.loads(response.read().decode("utf-8"))
-
-
-def http_post_json(url: str, payload: Dict[str, Any], headers: Dict[str, str] | None = None, timeout: int = 45):
-    body = json.dumps(payload).encode("utf-8")
-    merged_headers = {"Content-Type": "application/json"}
-    if headers:
-        merged_headers.update(headers)
-    request = urllib.request.Request(url, data=body, headers=merged_headers, method="POST")
-    with urllib.request.urlopen(request, timeout=timeout) as response:
-        return json.loads(response.read().decode("utf-8"))
 
 
 def run_with_heartbeat(action: str, func, *args, **kwargs):
@@ -277,79 +220,6 @@ def _join_sources(existing_seen_on: str, new_source: str) -> str:
     return ", ".join(existing_parts)
 
 
-def _normalized_domain_from_url(url: str) -> str:
-    try:
-        domain = (urlparse(url).netloc or "").lower().strip()
-    except Exception:
-        return ""
-    if domain.startswith("www."):
-        domain = domain[4:]
-    return domain
-
-
-def _domain_is_blocked(domain: str, blocked_domains: List[str]) -> bool:
-    if not domain:
-        return False
-    for blocked in blocked_domains:
-        candidate = blocked.lower().strip()
-        if not candidate:
-            continue
-        if domain == candidate or domain.endswith(f".{candidate}"):
-            return True
-    return False
-
-
-def _extract_redirect_urls(raw_url: str) -> List[str]:
-    values: List[str] = []
-    try:
-        parsed = urlparse(raw_url)
-        query = parse_qs(parsed.query)
-    except Exception:
-        return values
-
-    for key in ("url", "target", "redirect", "redirectUrl", "destination", "dest", "to", "u", "r"):
-        for item in query.get(key, []):
-            decoded = unquote(str(item or "").strip())
-            if decoded.startswith("http://") or decoded.startswith("https://"):
-                values.append(decoded)
-    return values
-
-
-@lru_cache(maxsize=1000)
-def _resolve_final_redirect_url(raw_url: str) -> str:
-    headers = {"User-Agent": USER_AGENT}
-    try:
-        request = urllib.request.Request(raw_url, headers=headers, method="HEAD")
-        with urllib.request.urlopen(request, timeout=JOOBLE_REDIRECT_TIMEOUT_SECONDS) as response:
-            return response.geturl()
-    except Exception:
-        try:
-            request = urllib.request.Request(raw_url, headers=headers, method="GET")
-            with urllib.request.urlopen(request, timeout=JOOBLE_REDIRECT_TIMEOUT_SECONDS) as response:
-                return response.geturl()
-        except Exception:
-            return raw_url
-
-
-def _filter_jooble_job_url(raw_url: str) -> tuple[bool, str]:
-    if not raw_url:
-        return True, ""
-
-    candidates = [raw_url, *_extract_redirect_urls(raw_url)]
-    for candidate in candidates:
-        if _domain_is_blocked(_normalized_domain_from_url(candidate), JOOBLE_BLOCKED_DOMAINS):
-            return True, raw_url
-
-    resolved = raw_url
-    raw_domain = _normalized_domain_from_url(raw_url)
-    if JOOBLE_FILTER_REDIRECTS and ("jooble." in raw_domain or "/rd/" in raw_url):
-        resolved = _resolve_final_redirect_url(raw_url)
-        if _domain_is_blocked(_normalized_domain_from_url(resolved), JOOBLE_BLOCKED_DOMAINS):
-            return True, resolved
-
-    return False, resolved
-
-
 def _normalized_text_for_term_matching(value: str) -> str:
     return re.sub(r"[^a-z0-9]+", "", value.lower())
 
@@ -376,10 +246,10 @@ def _tokenize_filter_expression(expression: str) -> List[str]:
             i += 1
             continue
         if ch in ("'", '"'):
-            quote = ch
+            quote_char = ch
             i += 1
             start = i
-            while i < len(expression) and expression[i] != quote:
+            while i < len(expression) and expression[i] != quote_char:
                 i += 1
             if i >= len(expression):
                 raise ValueError("Unclosed quote in TITLE_FILTER_EXPRESSION")
@@ -739,731 +609,6 @@ def scrape_keyword_jobs(page, keyword: str, now_utc: datetime) -> tuple[List[Dic
     }
 
 
-def _page_is_likely_bot_blocked(page) -> bool:
-    try:
-        body_text = page.locator("body").inner_text(timeout=2000).lower()
-    except Exception:
-        return False
-    markers = [
-        "captcha",
-        "verify you are human",
-        "security check",
-        "access denied",
-        "unusual traffic",
-    ]
-    return any(marker in body_text for marker in markers)
-
-
-def _jsonld_collect_job_postings(node, collected: List[Dict[str, Any]]) -> None:
-    if isinstance(node, list):
-        for item in node:
-            _jsonld_collect_job_postings(item, collected)
-        return
-
-    if not isinstance(node, dict):
-        return
-
-    raw_type = node.get("@type")
-    type_values = []
-    if isinstance(raw_type, str):
-        type_values = [raw_type]
-    elif isinstance(raw_type, list):
-        type_values = [str(value) for value in raw_type]
-
-    if any(value.lower() == "jobposting" for value in type_values):
-        collected.append(node)
-
-    for value in node.values():
-        if isinstance(value, (dict, list)):
-            _jsonld_collect_job_postings(value, collected)
-
-
-def _extract_location_from_jobposting(job_posting: Dict[str, Any]) -> str:
-    raw_location = job_posting.get("jobLocation")
-    if isinstance(raw_location, list) and raw_location:
-        raw_location = raw_location[0]
-
-    if isinstance(raw_location, dict):
-        address = raw_location.get("address", raw_location)
-        if isinstance(address, dict):
-            parts = [
-                str(address.get("addressLocality") or "").strip(),
-                str(address.get("addressRegion") or "").strip(),
-                str(address.get("addressCountry") or "").strip(),
-            ]
-            return ", ".join(part for part in parts if part)
-        if isinstance(address, str):
-            return address.strip()
-
-    if isinstance(raw_location, str):
-        return raw_location.strip()
-    return ""
-
-
-def _extract_source_job_id_from_jsonld(job_posting: Dict[str, Any]) -> str:
-    identifier = job_posting.get("identifier")
-    if isinstance(identifier, dict):
-        return str(identifier.get("value") or identifier.get("@value") or "").strip()
-    if isinstance(identifier, list) and identifier:
-        first = identifier[0]
-        if isinstance(first, dict):
-            return str(first.get("value") or first.get("@value") or "").strip()
-        return str(first).strip()
-    if identifier:
-        return str(identifier).strip()
-    return ""
-
-
-def _extract_job_postings_from_jsonld(page, base_url: str, source: str, keyword: str) -> List[Dict[str, str]]:
-    jobs: List[Dict[str, str]] = []
-    seen_urls = set()
-    scripts = page.locator("script[type='application/ld+json']")
-    script_count = min(scripts.count(), 40)
-    all_job_postings: List[Dict[str, Any]] = []
-
-    for index in range(script_count):
-        script = scripts.nth(index)
-        try:
-            raw_text = script.inner_text(timeout=800).strip()
-            if not raw_text:
-                continue
-            json_payload = json.loads(raw_text)
-            _jsonld_collect_job_postings(json_payload, all_job_postings)
-        except Exception:
-            continue
-
-    for job_posting in all_job_postings:
-        title = str(job_posting.get("title") or "").strip()
-        job_url_raw = str(job_posting.get("url") or "").strip()
-        if not title or not job_url_raw:
-            continue
-        job_url = _normalize_job_url(urljoin(base_url, job_url_raw))
-        if job_url in seen_urls:
-            continue
-        seen_urls.add(job_url)
-
-        hiring_org = job_posting.get("hiringOrganization")
-        if isinstance(hiring_org, dict):
-            company = str(hiring_org.get("name") or "").strip()
-        else:
-            company = str(hiring_org or "").strip()
-
-        source_job_id = _extract_source_job_id_from_jsonld(job_posting)
-        jobs.append(
-            {
-                "title": title,
-                "company": company,
-                "location": _extract_location_from_jobposting(job_posting),
-                "date_posted": str(job_posting.get("datePosted") or "").strip(),
-                "job_url": job_url,
-                "keyword": keyword,
-                "source": source,
-                "source_job_id": source_job_id,
-                "canonical_key": _build_canonical_key(title, company, _extract_location_from_jobposting(job_posting)),
-            }
-        )
-    return jobs
-
-
-def scrape_indeed_keyword_jobs(page, keyword: str, now_utc: datetime) -> tuple[List[Dict[str, str]], Dict[str, Any]]:
-    jobs: List[Dict[str, str]] = []
-    seen_urls = set()
-    skipped_old = 0
-    kept_unknown_date = 0
-    skipped_missing_url = 0
-    skipped_term_filter = 0
-    page_timeouts = 0
-    pages_scanned = 0
-    no_results_pages = 0
-
-    for page_index in range(INDEED_MAX_PAGES):
-        if page_index > 0:
-            _sleep_random(PAGE_DELAY_RANGE_SECONDS, "between indeed pages")
-
-        start = page_index * 10
-        url = (
-            f"https://www.indeed.com/jobs?q={quote_plus(keyword)}&l={quote_plus(SCRAPE_LOCATION)}"
-            f"&sort=date&fromage={MAX_POST_AGE_DAYS}&start={start}"
-        )
-        log(f"Loading Indeed page {page_index + 1}/{INDEED_MAX_PAGES}: {url}")
-        try:
-            run_with_heartbeat(
-                action=f"loading indeed page {page_index + 1} for '{keyword}'",
-                func=page.goto,
-                url=url,
-                wait_until="domcontentloaded",
-                timeout=60000,
-            )
-        except PlaywrightTimeoutError:
-            page_timeouts += 1
-            continue
-
-        if _page_is_likely_bot_blocked(page):
-            log(f"Indeed appears blocked for keyword '{keyword}'")
-            page_timeouts += 1
-            break
-
-        pages_scanned += 1
-        page_jobs = _extract_job_postings_from_jsonld(page, "https://www.indeed.com", "indeed", keyword)
-
-        if not page_jobs:
-            cards = page.locator("div.job_seen_beacon, div[data-jk]")
-            card_count = min(cards.count(), 120)
-            if card_count == 0:
-                no_results_pages += 1
-                break
-
-            for i in range(card_count):
-                card = cards.nth(i)
-                title = _safe_text(card, ["h2.jobTitle span[title]", "h2.jobTitle span", "a[data-jk] span"])
-                if not title:
-                    continue
-                if not _title_matches_term_filters(title):
-                    skipped_term_filter += 1
-                    continue
-                company = _safe_text(card, ["span[data-testid='company-name']", "span.companyName"])
-                location = _safe_text(card, ["div[data-testid='text-location']", "div.companyLocation"])
-                posted_date = _safe_text(card, ["span.date", "[data-testid='myJobsStateDate']"])
-                is_recent, is_unknown_date = _is_recent_enough(posted_date, now_utc)
-                if is_unknown_date:
-                    kept_unknown_date += 1
-                if not is_recent:
-                    skipped_old += 1
-                    continue
-
-                link = card.locator("h2.jobTitle a, a[data-jk]").first
-                href = ""
-                try:
-                    href = link.get_attribute("href", timeout=1000) or ""
-                except Exception:
-                    href = ""
-                if not href:
-                    skipped_missing_url += 1
-                    continue
-                job_url = _normalize_job_url(urljoin("https://www.indeed.com", href))
-                if job_url in seen_urls:
-                    continue
-                seen_urls.add(job_url)
-
-                data_jk = ""
-                try:
-                    data_jk = (card.get_attribute("data-jk", timeout=300) or "").strip()
-                except Exception:
-                    data_jk = ""
-                if not data_jk:
-                    data_jk = (parse_qs(urlparse(job_url).query).get("jk", [""])[0] or "").strip()
-
-                jobs.append(
-                    {
-                        "title": title,
-                        "company": company,
-                        "location": location,
-                        "date_posted": posted_date,
-                        "job_url": job_url,
-                        "keyword": keyword,
-                        "source": "indeed",
-                        "source_job_id": data_jk,
-                        "canonical_key": _build_canonical_key(title, company, location),
-                    }
-                )
-        else:
-            for item in page_jobs:
-                title = item["title"]
-                if not _title_matches_term_filters(title):
-                    skipped_term_filter += 1
-                    continue
-                posted_date = item.get("date_posted", "")
-                is_recent, is_unknown_date = _is_recent_enough(posted_date, now_utc)
-                if is_unknown_date:
-                    kept_unknown_date += 1
-                if not is_recent:
-                    skipped_old += 1
-                    continue
-                job_url = item.get("job_url", "")
-                if not job_url:
-                    skipped_missing_url += 1
-                    continue
-                if job_url in seen_urls:
-                    continue
-                seen_urls.add(job_url)
-                jobs.append(item)
-
-    return jobs, {
-        "keyword": keyword,
-        "source": "indeed",
-        "pages_scanned": pages_scanned,
-        "page_timeouts": page_timeouts,
-        "no_results_pages": no_results_pages,
-        "rows_collected": len(jobs),
-        "skipped_old": skipped_old,
-        "kept_unknown_date": kept_unknown_date,
-        "missing_url": skipped_missing_url,
-        "skipped_term_filter": skipped_term_filter,
-    }
-
-
-def scrape_ziprecruiter_keyword_jobs(page, keyword: str, now_utc: datetime) -> tuple[List[Dict[str, str]], Dict[str, Any]]:
-    jobs: List[Dict[str, str]] = []
-    seen_urls = set()
-    skipped_old = 0
-    kept_unknown_date = 0
-    skipped_missing_url = 0
-    skipped_term_filter = 0
-    page_timeouts = 0
-    pages_scanned = 0
-    no_results_pages = 0
-
-    for page_number in range(1, ZIPRECRUITER_MAX_PAGES + 1):
-        if page_number > 1:
-            _sleep_random(PAGE_DELAY_RANGE_SECONDS, "between ziprecruiter pages")
-
-        url = (
-            "https://www.ziprecruiter.com/jobs-search"
-            f"?search={quote_plus(keyword)}&location={quote_plus(SCRAPE_LOCATION)}"
-            f"&days={MAX_POST_AGE_DAYS}&page={page_number}"
-        )
-        log(f"Loading ZipRecruiter page {page_number}/{ZIPRECRUITER_MAX_PAGES}: {url}")
-        try:
-            run_with_heartbeat(
-                action=f"loading ziprecruiter page {page_number} for '{keyword}'",
-                func=page.goto,
-                url=url,
-                wait_until="domcontentloaded",
-                timeout=60000,
-            )
-        except PlaywrightTimeoutError:
-            page_timeouts += 1
-            continue
-
-        if _page_is_likely_bot_blocked(page):
-            log(f"ZipRecruiter appears blocked for keyword '{keyword}'")
-            page_timeouts += 1
-            break
-
-        pages_scanned += 1
-        page_jobs = _extract_job_postings_from_jsonld(
-            page, "https://www.ziprecruiter.com", "ziprecruiter", keyword
-        )
-
-        if not page_jobs:
-            links = page.locator("a[href*='/jobs/']")
-            link_count = min(links.count(), 120)
-            if link_count == 0:
-                no_results_pages += 1
-                break
-
-            for i in range(link_count):
-                link = links.nth(i)
-                try:
-                    href = (link.get_attribute("href", timeout=800) or "").strip()
-                except Exception:
-                    href = ""
-                if not href:
-                    continue
-                job_url = _normalize_job_url(urljoin("https://www.ziprecruiter.com", href))
-                if job_url in seen_urls:
-                    continue
-                title = ""
-                try:
-                    title = (link.inner_text(timeout=800) or "").strip()
-                except Exception:
-                    title = ""
-                if not title:
-                    try:
-                        title = (link.get_attribute("title", timeout=300) or "").strip()
-                    except Exception:
-                        title = ""
-                if not title:
-                    continue
-                if not _title_matches_term_filters(title):
-                    skipped_term_filter += 1
-                    continue
-
-                seen_urls.add(job_url)
-                jobs.append(
-                    {
-                        "title": title,
-                        "company": "",
-                        "location": "",
-                        "date_posted": "",
-                        "job_url": job_url,
-                        "keyword": keyword,
-                        "source": "ziprecruiter",
-                        "source_job_id": "",
-                        "canonical_key": _build_canonical_key(title, "", ""),
-                    }
-                )
-                kept_unknown_date += 1
-        else:
-            for item in page_jobs:
-                title = item["title"]
-                if not _title_matches_term_filters(title):
-                    skipped_term_filter += 1
-                    continue
-                posted_date = item.get("date_posted", "")
-                is_recent, is_unknown_date = _is_recent_enough(posted_date, now_utc)
-                if is_unknown_date:
-                    kept_unknown_date += 1
-                if not is_recent:
-                    skipped_old += 1
-                    continue
-                job_url = item.get("job_url", "")
-                if not job_url:
-                    skipped_missing_url += 1
-                    continue
-                if job_url in seen_urls:
-                    continue
-                seen_urls.add(job_url)
-                jobs.append(item)
-
-    return jobs, {
-        "keyword": keyword,
-        "source": "ziprecruiter",
-        "pages_scanned": pages_scanned,
-        "page_timeouts": page_timeouts,
-        "no_results_pages": no_results_pages,
-        "rows_collected": len(jobs),
-        "skipped_old": skipped_old,
-        "kept_unknown_date": kept_unknown_date,
-        "missing_url": skipped_missing_url,
-        "skipped_term_filter": skipped_term_filter,
-    }
-
-
-def scrape_usajobs_keyword_jobs(keyword: str, now_utc: datetime) -> tuple[List[Dict[str, str]], Dict[str, Any]]:
-    jobs: List[Dict[str, str]] = []
-    skipped_old = 0
-    kept_unknown_date = 0
-    skipped_missing_url = 0
-    skipped_term_filter = 0
-    page_timeouts = 0
-    pages_scanned = 0
-
-    if not USAJOBS_API_KEY or not USAJOBS_USER_AGENT_EMAIL:
-        log("Skipping USAJobs: missing USAJOBS_API_KEY or USAJOBS_USER_AGENT_EMAIL.")
-        return jobs, {
-            "keyword": keyword,
-            "source": "usajobs",
-            "pages_scanned": 0,
-            "page_timeouts": 0,
-            "no_results_pages": 0,
-            "rows_collected": 0,
-            "skipped_old": 0,
-            "kept_unknown_date": 0,
-            "missing_url": 0,
-            "skipped_term_filter": 0,
-        }
-
-    headers = {
-        "Host": "data.usajobs.gov",
-        "User-Agent": USAJOBS_USER_AGENT_EMAIL,
-        "Authorization-Key": USAJOBS_API_KEY,
-    }
-    seen_urls = set()
-    no_results_pages = 0
-
-    for page_number in range(1, USAJOBS_MAX_PAGES + 1):
-        query = (
-            f"https://data.usajobs.gov/api/search?Keyword={quote(keyword)}"
-            f"&Page={page_number}&ResultsPerPage={USAJOBS_RESULTS_PER_PAGE}"
-            "&SortField=OpenDate&SortDirection=Desc"
-        )
-        try:
-            payload = http_get_json(query, headers=headers, timeout=45)
-        except (urllib.error.URLError, TimeoutError, json.JSONDecodeError) as exc:
-            log(f"USAJobs fetch failed for keyword '{keyword}', page {page_number}: {exc}")
-            page_timeouts += 1
-            continue
-
-        pages_scanned += 1
-        items = (
-            payload.get("SearchResult", {}).get("SearchResultItems", [])
-            if isinstance(payload, dict)
-            else []
-        )
-        if not items:
-            no_results_pages += 1
-            break
-
-        for item in items:
-            descriptor = item.get("MatchedObjectDescriptor", {}) if isinstance(item, dict) else {}
-            title = (descriptor.get("PositionTitle") or "").strip()
-            if not _title_matches_term_filters(title):
-                skipped_term_filter += 1
-                continue
-
-            company = (descriptor.get("OrganizationName") or "USAJobs").strip()
-            location = (descriptor.get("PositionLocationDisplay") or "").strip()
-            posted_date = (descriptor.get("PublicationStartDate") or "").strip()
-            is_recent, is_unknown_date = _is_recent_enough(posted_date, now_utc)
-            if is_unknown_date:
-                kept_unknown_date += 1
-            if not is_recent:
-                skipped_old += 1
-                continue
-
-            job_url = (descriptor.get("PositionURI") or "").strip()
-            if not job_url:
-                skipped_missing_url += 1
-                continue
-            normalized_job_url = _normalize_job_url(job_url)
-            if normalized_job_url in seen_urls:
-                continue
-            seen_urls.add(normalized_job_url)
-
-            position_ids = descriptor.get("PositionID") if isinstance(descriptor.get("PositionID"), list) else []
-            source_job_id = str(position_ids[0]).strip() if position_ids else ""
-            jobs.append(
-                {
-                    "title": title,
-                    "company": company,
-                    "location": location,
-                    "date_posted": posted_date,
-                    "job_url": normalized_job_url,
-                    "keyword": keyword,
-                    "source": "usajobs",
-                    "source_job_id": source_job_id,
-                    "canonical_key": _build_canonical_key(title, company, location),
-                }
-            )
-
-    return jobs, {
-        "keyword": keyword,
-        "source": "usajobs",
-        "pages_scanned": pages_scanned,
-        "page_timeouts": page_timeouts,
-        "no_results_pages": no_results_pages,
-        "rows_collected": len(jobs),
-        "skipped_old": skipped_old,
-        "kept_unknown_date": kept_unknown_date,
-        "missing_url": skipped_missing_url,
-        "skipped_term_filter": skipped_term_filter,
-    }
-
-
-def scrape_adzuna_keyword_jobs(keyword: str, now_utc: datetime) -> tuple[List[Dict[str, str]], Dict[str, Any]]:
-    jobs: List[Dict[str, str]] = []
-    skipped_old = 0
-    kept_unknown_date = 0
-    skipped_missing_url = 0
-    skipped_term_filter = 0
-    page_timeouts = 0
-    pages_scanned = 0
-    no_results_pages = 0
-
-    if not ADZUNA_APP_ID or not ADZUNA_APP_KEY:
-        log("Skipping Adzuna: missing ADZUNA_APP_ID or ADZUNA_APP_KEY.")
-        return jobs, {
-            "keyword": keyword,
-            "source": "adzuna",
-            "pages_scanned": 0,
-            "page_timeouts": 0,
-            "no_results_pages": 0,
-            "rows_collected": 0,
-            "skipped_old": 0,
-            "kept_unknown_date": 0,
-            "missing_url": 0,
-            "skipped_term_filter": 0,
-        }
-
-    seen_urls = set()
-    for page_number in range(1, ADZUNA_MAX_PAGES + 1):
-        query = (
-            f"https://api.adzuna.com/v1/api/jobs/{quote(ADZUNA_COUNTRY)}/search/{page_number}"
-            f"?app_id={quote(ADZUNA_APP_ID)}&app_key={quote(ADZUNA_APP_KEY)}"
-            f"&results_per_page={ADZUNA_RESULTS_PER_PAGE}&sort_by=date&what={quote(keyword)}"
-        )
-        try:
-            payload = http_get_json(query, timeout=45)
-        except (urllib.error.URLError, TimeoutError, json.JSONDecodeError) as exc:
-            log(f"Adzuna fetch failed for keyword '{keyword}', page {page_number}: {exc}")
-            page_timeouts += 1
-            continue
-
-        pages_scanned += 1
-        results = payload.get("results", []) if isinstance(payload, dict) else []
-        if not results:
-            no_results_pages += 1
-            break
-
-        for item in results:
-            title = (item.get("title") or "").strip()
-            if not _title_matches_term_filters(title):
-                skipped_term_filter += 1
-                continue
-
-            company = ""
-            raw_company = item.get("company")
-            if isinstance(raw_company, dict):
-                company = (raw_company.get("display_name") or "").strip()
-            company = company or "Unknown Company"
-
-            location = ""
-            raw_location = item.get("location")
-            if isinstance(raw_location, dict):
-                location = (raw_location.get("display_name") or "").strip()
-
-            posted_date = (item.get("created") or "").strip()
-            is_recent, is_unknown_date = _is_recent_enough(posted_date, now_utc)
-            if is_unknown_date:
-                kept_unknown_date += 1
-            if not is_recent:
-                skipped_old += 1
-                continue
-
-            job_url = (item.get("redirect_url") or "").strip()
-            if not job_url:
-                skipped_missing_url += 1
-                continue
-            normalized_job_url = _normalize_job_url(job_url)
-            if normalized_job_url in seen_urls:
-                continue
-            seen_urls.add(normalized_job_url)
-
-            jobs.append(
-                {
-                    "title": title,
-                    "company": company,
-                    "location": location,
-                    "date_posted": posted_date,
-                    "job_url": normalized_job_url,
-                    "keyword": keyword,
-                    "source": "adzuna",
-                    "source_job_id": str(item.get("id") or "").strip(),
-                    "canonical_key": _build_canonical_key(title, company, location),
-                }
-            )
-
-    return jobs, {
-        "keyword": keyword,
-        "source": "adzuna",
-        "pages_scanned": pages_scanned,
-        "page_timeouts": page_timeouts,
-        "no_results_pages": no_results_pages,
-        "rows_collected": len(jobs),
-        "skipped_old": skipped_old,
-        "kept_unknown_date": kept_unknown_date,
-        "missing_url": skipped_missing_url,
-        "skipped_term_filter": skipped_term_filter,
-    }
-
-
-def scrape_jooble_keyword_jobs(keyword: str, now_utc: datetime) -> tuple[List[Dict[str, str]], Dict[str, Any]]:
-    jobs: List[Dict[str, str]] = []
-    skipped_old = 0
-    kept_unknown_date = 0
-    skipped_missing_url = 0
-    skipped_blocked_redirects = 0
-    skipped_term_filter = 0
-    page_timeouts = 0
-    pages_scanned = 0
-    no_results_pages = 0
-
-    if not JOOBLE_API_KEY:
-        log("Skipping Jooble: missing JOOBLE_API_KEY.")
-        return jobs, {
-            "keyword": keyword,
-            "source": "jooble",
-            "pages_scanned": 0,
-            "page_timeouts": 0,
-            "no_results_pages": 0,
-            "rows_collected": 0,
-            "skipped_old": 0,
-            "kept_unknown_date": 0,
-            "missing_url": 0,
-            "skipped_blocked_redirects": 0,
-            "skipped_term_filter": 0,
-        }
-
-    endpoint = f"https://jooble.org/api/{quote(JOOBLE_API_KEY)}"
-    seen_urls = set()
-
-    for page_number in range(1, JOOBLE_MAX_PAGES + 1):
-        payload = {"keywords": keyword, "location": JOOBLE_LOCATION, "page": page_number}
-        try:
-            response = http_post_json(endpoint, payload=payload, timeout=45)
-        except (urllib.error.URLError, TimeoutError, json.JSONDecodeError) as exc:
-            log(f"Jooble fetch failed for keyword '{keyword}', page {page_number}: {exc}")
-            page_timeouts += 1
-            continue
-
-        pages_scanned += 1
-        results = response.get("jobs", []) if isinstance(response, dict) else []
-        if not results:
-            no_results_pages += 1
-            break
-
-        for item in results:
-            title = (item.get("title") or "").strip()
-            if not _title_matches_term_filters(title):
-                skipped_term_filter += 1
-                continue
-
-            company = (item.get("company") or item.get("companyName") or "").strip() or "Unknown Company"
-            location = (item.get("location") or "").strip()
-            posted_date = (
-                item.get("updated")
-                or item.get("updatedAt")
-                or item.get("created")
-                or item.get("posted")
-                or ""
-            )
-            posted_date = str(posted_date).strip()
-            is_recent, is_unknown_date = _is_recent_enough(posted_date, now_utc)
-            if is_unknown_date:
-                kept_unknown_date += 1
-            if not is_recent:
-                skipped_old += 1
-                continue
-
-            job_url = (item.get("link") or item.get("url") or "").strip()
-            if not job_url:
-                skipped_missing_url += 1
-                continue
-            is_blocked, resolved_url = _filter_jooble_job_url(job_url)
-            if is_blocked:
-                skipped_blocked_redirects += 1
-                continue
-            job_url = resolved_url or job_url
-            normalized_job_url = _normalize_job_url(job_url)
-            if normalized_job_url in seen_urls:
-                continue
-            seen_urls.add(normalized_job_url)
-
-            jobs.append(
-                {
-                    "title": title,
-                    "company": company,
-                    "location": location,
-                    "date_posted": posted_date,
-                    "job_url": normalized_job_url,
-                    "keyword": keyword,
-                    "source": "jooble",
-                    "source_job_id": str(item.get("id") or item.get("jobId") or "").strip(),
-                    "canonical_key": _build_canonical_key(title, company, location),
-                }
-            )
-
-    log(
-        f"Collected {len(jobs)} Jooble rows for '{keyword}'. "
-        f"Skipped blocked redirects: {skipped_blocked_redirects}, "
-        f"old: {skipped_old}, missing URL: {skipped_missing_url}, title-term-filter: {skipped_term_filter}"
-    )
-    return jobs, {
-        "keyword": keyword,
-        "source": "jooble",
-        "pages_scanned": pages_scanned,
-        "page_timeouts": page_timeouts,
-        "no_results_pages": no_results_pages,
-        "rows_collected": len(jobs),
-        "skipped_old": skipped_old,
-        "kept_unknown_date": kept_unknown_date,
-        "missing_url": skipped_missing_url,
-        "skipped_blocked_redirects": skipped_blocked_redirects,
-        "skipped_term_filter": skipped_term_filter,
-    }
-
-
 def get_gspread_client():
     creds_path = Path(CREDS_FILE)
     if not creds_path.exists():
@@ -1623,7 +768,6 @@ def write_row_updates(worksheet, row_updates: Dict[int, List[str]]) -> None:
 
 
 def build_source_summary(keyword_summaries: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    aggregated: Dict[str, Dict[str, Any]] = {}
     tracked_fields = [
         "rows_collected",
         "new_rows_appended",
@@ -1637,19 +781,10 @@ def build_source_summary(keyword_summaries: List[Dict[str, Any]]) -> List[Dict[s
         "skipped_term_filter",
         "page_timeouts",
     ]
-
-    for item in keyword_summaries:
-        source_name = str(item.get("source", "unknown"))
-        if source_name not in aggregated:
-            aggregated[source_name] = {"source": source_name, "batches": 0}
-            for field in tracked_fields:
-                aggregated[source_name][field] = 0
-
-        aggregated[source_name]["batches"] += 1
-        for field in tracked_fields:
-            aggregated[source_name][field] += int(item.get(field, 0))
-
-    return [aggregated[key] for key in sorted(aggregated.keys())]
+    summary = {"source": SOURCE_NAME, "batches": len(keyword_summaries)}
+    for field in tracked_fields:
+        summary[field] = sum(int(item.get(field, 0)) for item in keyword_summaries)
+    return [summary]
 
 
 def get_next_empty_row(worksheet) -> int:
@@ -1680,33 +815,10 @@ def write_rows_to_next_empty_range(worksheet, rows: List[List[str]]) -> None:
 
 def main() -> None:
     started_at = datetime.utcnow()
+    enabled_sources = [SOURCE_NAME]
 
-    enabled_sources = ["linkedin"]
-    disabled_sources: Dict[str, str] = {}
-    if INDEED_ENABLED:
-        enabled_sources.append("indeed")
-    else:
-        disabled_sources["indeed"] = "disabled by INDEED_ENABLED"
-    if ZIPRECRUITER_ENABLED:
-        enabled_sources.append("ziprecruiter")
-    else:
-        disabled_sources["ziprecruiter"] = "disabled by ZIPRECRUITER_ENABLED"
-    if USAJOBS_API_KEY and USAJOBS_USER_AGENT_EMAIL:
-        enabled_sources.append("usajobs")
-    else:
-        disabled_sources["usajobs"] = "missing USAJOBS_API_KEY or USAJOBS_USER_AGENT_EMAIL"
-    if ADZUNA_APP_ID and ADZUNA_APP_KEY:
-        enabled_sources.append("adzuna")
-    else:
-        disabled_sources["adzuna"] = "missing ADZUNA_APP_ID or ADZUNA_APP_KEY"
-    if JOOBLE_API_KEY:
-        enabled_sources.append("jooble")
-    else:
-        disabled_sources["jooble"] = "missing JOOBLE_API_KEY"
-
-    total_batches = len(KEYWORDS) * len(enabled_sources)
     summary: Dict[str, Any] = {
-        "phase": "phase3_multi_source",
+        "phase": "linkedin_only",
         "status": "running",
         "started_at_utc": started_at.isoformat() + "Z",
         "finished_at_utc": "",
@@ -1714,7 +826,7 @@ def main() -> None:
         "sheet_id": SHEET_ID,
         "worksheet_name": WORKSHEET_NAME,
         "keyword_source": "KEYWORDS env var" if KEYWORDS_ENV else "DEFAULT_KEYWORDS list",
-        "keywords_total": total_batches,
+        "keywords_total": len(KEYWORDS),
         "keywords_processed": 0,
         "runtime_config": {
             "MAX_PAGES_PER_KEYWORD": MAX_PAGES_PER_KEYWORD,
@@ -1723,15 +835,7 @@ def main() -> None:
             "KEYWORD_DELAY_RANGE_SECONDS": list(KEYWORD_DELAY_RANGE_SECONDS),
             "HEARTBEAT_INTERVAL_SECONDS": HEARTBEAT_INTERVAL_SECONDS,
             "TITLE_FILTER_EXPRESSION": TITLE_FILTER_EXPRESSION,
-            "SUPPORTED_SOURCES": SUPPORTED_SOURCES,
             "ENABLED_SOURCES": enabled_sources,
-            "DISABLED_SOURCES": disabled_sources,
-            "INDEED_MAX_PAGES": INDEED_MAX_PAGES,
-            "ZIPRECRUITER_MAX_PAGES": ZIPRECRUITER_MAX_PAGES,
-            "SCRAPE_LOCATION": SCRAPE_LOCATION,
-            "USAJOBS_MAX_PAGES": USAJOBS_MAX_PAGES,
-            "ADZUNA_MAX_PAGES": ADZUNA_MAX_PAGES,
-            "JOOBLE_MAX_PAGES": JOOBLE_MAX_PAGES,
         },
         "totals": {
             "rows_collected_before_dedupe": 0,
@@ -1765,8 +869,6 @@ def main() -> None:
         f"Total keywords: {len(KEYWORDS)}"
     )
     log(f"Enabled job sources: {enabled_sources}")
-    if disabled_sources:
-        log(f"Skipped sources due missing config: {disabled_sources}")
     log(f"Date filter: jobs posted within the last {MAX_POST_AGE_DAYS} days.")
     log(
         "Runtime config: "
@@ -1805,17 +907,10 @@ def main() -> None:
                 viewport={"width": 1366, "height": 768},
             )
             page = context.new_page()
-            def process_jobs_batch(
-                batch_label: str, batch_jobs: List[Dict[str, str]], batch_stats: Dict[str, Any]
-            ) -> None:
-                nonlocal total_new_rows
-                nonlocal total_duplicates_skipped
-                nonlocal total_merged_existing_rows
-                nonlocal total_merged_by_job_url
-                nonlocal total_merged_by_canonical
-                nonlocal total_canonical_dupes_in_run
-                nonlocal total_canonical_dupes_against_existing
 
+            for keyword_index, keyword in enumerate(KEYWORDS):
+                log(f"Starting keyword {keyword_index + 1}/{len(KEYWORDS)}: {keyword}")
+                batch_jobs, batch_stats = scrape_keyword_jobs(page, keyword, now_utc)
                 batch_rows_to_append: List[List[str]] = []
                 batch_duplicates_skipped = 0
                 batch_merged_existing_rows = 0
@@ -1854,13 +949,11 @@ def main() -> None:
                         matched_row_number = by_canonical_key[canonical_key]
                         batch_merged_by_canonical += 1
 
-                    row_keyword = job.get("keyword", batch_label)
-
                     if matched_row_number is not None:
                         batch_duplicates_skipped += 1
                         batch_merged_existing_rows += 1
                         existing_row = rows_by_number.get(matched_row_number, [""] * len(HEADERS))
-                        merged_row = merge_job_into_existing_row(existing_row, job, row_keyword, date_added)
+                        merged_row = merge_job_into_existing_row(existing_row, job, keyword, date_added)
                         rows_by_number[matched_row_number] = merged_row
                         batch_row_updates[matched_row_number] = merged_row
                         by_job_url[job_url] = matched_row_number
@@ -1876,12 +969,12 @@ def main() -> None:
                         job["company"],
                         job["location"],
                         job["date_posted"],
-                        row_keyword,
+                        keyword,
                         date_added,
-                        job.get("source", SOURCE_NAME),
+                        SOURCE_NAME,
                         job.get("source_job_id", ""),
                         canonical_key,
-                        job.get("source", SOURCE_NAME),
+                        SOURCE_NAME,
                         date_added,
                         date_added,
                     ]
@@ -1896,12 +989,12 @@ def main() -> None:
                 if batch_rows_to_append:
                     log(
                         f"Appending {len(batch_rows_to_append)} rows to tab '{worksheet.title}' "
-                        f"for batch '{batch_label}'."
+                        f"for keyword '{keyword}'."
                     )
                     write_rows_to_next_empty_range(worksheet, batch_rows_to_append)
                     log(f"Appended {len(batch_rows_to_append)} rows to tab '{worksheet.title}'.")
                 else:
-                    log(f"No new rows to append for batch '{batch_label}'.")
+                    log(f"No new rows to append for keyword '{keyword}'.")
 
                 total_new_rows += len(batch_rows_to_append)
                 total_duplicates_skipped += batch_duplicates_skipped
@@ -1910,14 +1003,11 @@ def main() -> None:
                 total_merged_by_canonical += batch_merged_by_canonical
                 total_canonical_dupes_in_run += batch_canonical_dupes_in_run
                 total_canonical_dupes_against_existing += batch_canonical_dupes_against_existing
-                source_name = str(
-                    batch_stats.get("source")
-                    or (batch_jobs[0].get("source") if batch_jobs else SOURCE_NAME)
-                )
+
                 summary["keywords"].append(
                     {
                         **batch_stats,
-                        "source": source_name,
+                        "source": SOURCE_NAME,
                         "new_rows_appended": len(batch_rows_to_append),
                         "duplicates_skipped": batch_duplicates_skipped,
                         "merged_existing_rows": batch_merged_existing_rows,
@@ -1930,7 +1020,7 @@ def main() -> None:
                 summary["keywords_processed"] = len(summary["keywords"])
 
                 log(
-                    f"Batch complete: {batch_label}. New rows: {len(batch_rows_to_append)}. "
+                    f"Keyword complete: {keyword}. New rows: {len(batch_rows_to_append)}. "
                     f"Duplicates skipped: {batch_duplicates_skipped}. "
                     f"Merged existing rows: {batch_merged_existing_rows} "
                     f"(url={batch_merged_by_job_url}, canonical={batch_merged_by_canonical}). "
@@ -1938,32 +1028,8 @@ def main() -> None:
                     f"Canonical dupes vs existing: {batch_canonical_dupes_against_existing}"
                 )
 
-            for source_index, source_name in enumerate(enabled_sources):
-                for keyword_index, keyword in enumerate(KEYWORDS):
-                    log(
-                        f"Starting source '{source_name}' keyword "
-                        f"{keyword_index + 1}/{len(KEYWORDS)}: {keyword}"
-                    )
-
-                    if source_name == "linkedin":
-                        source_jobs, source_stats = scrape_keyword_jobs(page, keyword, now_utc)
-                    elif source_name == "indeed":
-                        source_jobs, source_stats = scrape_indeed_keyword_jobs(page, keyword, now_utc)
-                    elif source_name == "ziprecruiter":
-                        source_jobs, source_stats = scrape_ziprecruiter_keyword_jobs(page, keyword, now_utc)
-                    elif source_name == "usajobs":
-                        source_jobs, source_stats = scrape_usajobs_keyword_jobs(keyword, now_utc)
-                    elif source_name == "adzuna":
-                        source_jobs, source_stats = scrape_adzuna_keyword_jobs(keyword, now_utc)
-                    else:
-                        source_jobs, source_stats = scrape_jooble_keyword_jobs(keyword, now_utc)
-
-                    process_jobs_batch(f"{source_name}:{keyword}", source_jobs, source_stats)
-
-                    is_last_keyword = keyword_index == len(KEYWORDS) - 1
-                    is_last_source = source_index == len(enabled_sources) - 1
-                    if not (is_last_keyword and is_last_source):
-                        _sleep_random(KEYWORD_DELAY_RANGE_SECONDS, "between source batches")
+                if keyword_index != len(KEYWORDS) - 1:
+                    _sleep_random(KEYWORD_DELAY_RANGE_SECONDS, "between keyword batches")
 
             context.close()
             browser.close()
